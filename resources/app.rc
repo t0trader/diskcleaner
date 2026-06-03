@@ -1,0 +1,37 @@
+﻿#include <windows.h>
+#include <winuser.h>
+
+// Application icon (uncomment when icon file is available)
+// 100 ICON "app.ico"
+
+// Version information
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName", "DiskCleaner"
+            VALUE "FileDescription", "Windows 11 磁盘清理工具"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "diskcleaner"
+            VALUE "LegalCopyright", "Copyright (C) 2024"
+            VALUE "OriginalFilename", "DiskCleaner.exe"
+            VALUE "ProductName", "DiskCleaner"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END
+
+// Manifest is embedded via CMake/CVTRES

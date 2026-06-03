@@ -53,13 +53,32 @@ static std::vector<std::wstring> GetCleanupPaths(CleanupCategory category) {
         case CleanupCategory::RecoveryFiles:
             // Skip - system protected, cannot delete directly
             break;
-        case CleanupCategory::VisualStudioCache:
-            paths.push_back(ExpandPath(L"%LOCALAPPDATA%\\Microsoft\\VisualStudio"));
+        case CleanupCategory::VisualStudioCache: {
+            // Enumerate version subdirectories (e.g. 18.0_xxxxx) and only clean cache subdirs
+            std::wstring vsRoot = ExpandPath(L"%LOCALAPPDATA%\\Microsoft\\VisualStudio");
+            if (DirectoryExists(vsRoot)) {
+                try {
+                    for (const auto& entry : fs::directory_iterator(vsRoot,
+                            fs::directory_options::skip_permission_denied)) {
+                        if (!entry.is_directory()) continue;
+                        std::wstring dirName = entry.path().filename().wstring();
+                        // Version dirs match pattern like "18.0_xxxxxxxxxxxxx"
+                        if (dirName.find(L'.') != std::wstring::npos &&
+                            dirName.find(L'_') != std::wstring::npos) {
+                            // Only clean known-safe cache subdirectories, preserve settings
+                            paths.push_back(entry.path().wstring() + L"\\ComponentModelCache");
+                            paths.push_back(entry.path().wstring() + L"\\Roslyn");
+                            paths.push_back(entry.path().wstring() + L"\\ActivityLog.xml");
+                        }
+                    }
+                } catch (...) {}
+            }
             paths.push_back(ExpandPath(L"%LOCALAPPDATA%\\Microsoft\\VSApplicationInsights"));
             paths.push_back(ExpandPath(L"%PROGRAMDATA%\\Microsoft\\VisualStudio\\Packages"));
             paths.push_back(ExpandPath(L"%LOCALAPPDATA%\\NuGet\\Cache"));
             paths.push_back(ExpandPath(L"%TEMP%\\VisualStudio"));
             break;
+        }
         case CleanupCategory::NuGetCache:
             paths.push_back(ExpandPath(L"%USERPROFILE%\\.nuget\\packages"));
             paths.push_back(ExpandPath(L"%LOCALAPPDATA%\\NuGet\\Cache"));
@@ -179,6 +198,8 @@ bool Cleaner::CleanupCategoryItem(const CleanupItem& item, const CleanupProgress
         if (stopRequested_) break;
         if (DirectoryExists(path)) {
             CleanupDirectory(path, item.category, progressCb);
+        } else if (FileExists(path)) {
+            CleanupFile(path, item.category);
         }
     }
     return true;

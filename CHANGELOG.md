@@ -40,6 +40,7 @@
 
 #### GUI（[src/gui.cpp](src/gui.cpp)、[src/gui.h](src/gui.h)）
 - 扫描/清理过程中按钮改为 **Cancel** 并保持可用，支持真正的协作式取消。
+- 提权切换（Admin → SYSTEM / TrustedInstaller）时传递当前窗口位置、大小与最大化状态，新实例在原位置显示，不再跳到屏幕其他位置。
 - 修复 Clean 按钮清理结束后仍停留在 "Cleaning..." 的问题。
 - 取消后丢弃队列中残留的进度消息，避免旧状态覆盖 "cancelled" 提示。
 - 修复 `Select All` 使用过期内部状态的问题，改为读取复选框实际状态。

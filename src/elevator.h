@@ -27,8 +27,10 @@ public:
 
     // Elevate to SYSTEM or TrustedInstaller.
     // 启动一个新的提权实例（传入 --elevated），成功返回 true；
+    // extraArgs 会原样附加到新实例命令行（如窗口位置 --pos）。
     // 调用方应在成功后退出当前进程，失败时通过 err 获取原因。
-    static bool ElevateTo(ElevateLevel level, std::wstring* err = nullptr);
+    static bool ElevateTo(ElevateLevel level, std::wstring* err = nullptr,
+                          const std::wstring& extraArgs = L"");
 
     // Enable a specific privilege in current token
     static bool EnablePrivilege(const std::wstring& privilegeName);
@@ -54,10 +56,12 @@ private:
                               HANDLE hPrimaryToken, std::wstring* err = nullptr);
 
     // SYSTEM elevation: Privexec execute_with_system flow
-    static bool RunAsSystem(const std::wstring& exePath, std::wstring* err = nullptr);
+    static bool RunAsSystem(const std::wstring& exePath, const std::wstring& args,
+                            std::wstring* err = nullptr);
 
     // TrustedInstaller elevation: Privexec execute_with_ti flow
-    static bool RunAsTrustedInstaller(const std::wstring& exePath, std::wstring* err = nullptr);
+    static bool RunAsTrustedInstaller(const std::wstring& exePath, const std::wstring& args,
+                                      std::wstring* err = nullptr);
 };
 
 } // namespace diskcleaner

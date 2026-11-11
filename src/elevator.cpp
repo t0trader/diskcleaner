@@ -162,20 +162,28 @@ bool Elevator::EnablePrivilege(const std::wstring& privilegeName) {
     return result != FALSE;
 }
 
-bool Elevator::ElevateTo(ElevateLevel level, std::wstring* err) {
+bool Elevator::ElevateTo(ElevateLevel level, std::wstring* err,
+                         const std::wstring& extraArgs) {
     // Check if already at target level
     std::wstring current = GetCurrentLevel();
+
+    // 新实例始终带 --elevated，附加参数用于恢复窗口位置等
+    std::wstring args = L"--elevated";
+    if (!extraArgs.empty()) {
+        args += L" " + extraArgs;
+    }
+
     switch (level) {
         case ElevateLevel::Admin:
             return IsRunAsAdmin();
 
         case ElevateLevel::System:
             if (current == L"SYSTEM") return true;
-            return RunAsSystem(GetModulePath(), err);
+            return RunAsSystem(GetModulePath(), args, err);
 
         case ElevateLevel::TrustedInstaller:
             if (current == L"TrustedInstaller") return true;
-            return RunAsTrustedInstaller(GetModulePath(), err);
+            return RunAsTrustedInstaller(GetModulePath(), args, err);
     }
     return false;
 }
@@ -343,7 +351,8 @@ bool Elevator::LaunchProcess(const std::wstring& exePath, const std::wstring& ar
 // SYSTEM elevation (Privexec execute_with_system)
 // ============================================
 
-bool Elevator::RunAsSystem(const std::wstring& exePath, std::wstring* err) {
+bool Elevator::RunAsSystem(const std::wstring& exePath, const std::wstring& args,
+                           std::wstring* err) {
     DWORD sessionId = 0;
     if (!EnableSeDebugPrivilege(sessionId, err)) return false;
 
@@ -407,7 +416,7 @@ bool Elevator::RunAsSystem(const std::wstring& exePath, std::wstring* err) {
     SetTokenInformation(hPrimary, TokenSessionId, &sessionId, sizeof(sessionId));
 
     // Step 7: Launch WHILE STILL IMPERSONATING SYSTEM
-    bool ok = LaunchProcess(exePath, L"--elevated", hPrimary, err);
+    bool ok = LaunchProcess(exePath, args, hPrimary, err);
 
     RevertToSelf();
     CloseHandle(hImp);
@@ -419,7 +428,8 @@ bool Elevator::RunAsSystem(const std::wstring& exePath, std::wstring* err) {
 // TrustedInstaller elevation (Privexec execute_with_ti)
 // ============================================
 
-bool Elevator::RunAsTrustedInstaller(const std::wstring& exePath, std::wstring* err) {
+bool Elevator::RunAsTrustedInstaller(const std::wstring& exePath, const std::wstring& args,
+                                     std::wstring* err) {
     DWORD sessionId = 0;
     if (!EnableSeDebugPrivilege(sessionId, err)) return false;
 
@@ -486,7 +496,7 @@ bool Elevator::RunAsTrustedInstaller(const std::wstring& exePath, std::wstring* 
     SetTokenInformation(hPrimary, TokenSessionId, &sessionId, sizeof(sessionId));
 
     // Step 5: Launch WHILE STILL IMPERSONATING SYSTEM
-    bool ok = LaunchProcess(exePath, L"--elevated", hPrimary, err);
+    bool ok = LaunchProcess(exePath, args, hPrimary, err);
 
     RevertToSelf();
     CloseHandle(hImp);

@@ -48,7 +48,8 @@ MainWindow::~MainWindow() {
     if (hFontBold_) DeleteObject(hFontBold_);
 }
 
-bool MainWindow::Create(HINSTANCE hInstance, int nCmdShow) {
+bool MainWindow::Create(HINSTANCE hInstance, int nCmdShow,
+                        const RECT* initialRect, bool maximized) {
     hInstance_ = hInstance;
 
     INITCOMMONCONTROLSEX icc = {sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES};
@@ -68,21 +69,42 @@ bool MainWindow::Create(HINSTANCE hInstance, int nCmdShow) {
     UINT sysDpi = GetDpiForSystem();
     if (sysDpi == 0) sysDpi = 96;
 
+    int x = CW_USEDEFAULT;
+    int y = CW_USEDEFAULT;
+    int width = MulDiv(800, static_cast<int>(sysDpi), 96);
+    int height = MulDiv(600, static_cast<int>(sysDpi), 96);
+
+    // 提权后的新实例沿用原窗口的位置与大小
+    const bool hasPlacement = initialRect &&
+        initialRect->right > initialRect->left &&
+        initialRect->bottom > initialRect->top;
+    if (hasPlacement) {
+        x = initialRect->left;
+        y = initialRect->top;
+        width = initialRect->right - initialRect->left;
+        height = initialRect->bottom - initialRect->top;
+    }
+
     hWnd_ = CreateWindowExW(
         WS_EX_APPWINDOW,
         MAIN_WINDOW_CLASS,
         L"Disk Cleaner - Windows 11",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT,
-        MulDiv(800, static_cast<int>(sysDpi), 96),
-        MulDiv(600, static_cast<int>(sysDpi), 96),
+        x, y, width, height,
         nullptr, nullptr,
         hInstance, this
     );
 
     if (!hWnd_) return false;
 
-    ShowWindow(hWnd_, nCmdShow);
+    if (maximized) {
+        ShowWindow(hWnd_, SW_SHOWMAXIMIZED);
+    } else if (hasPlacement) {
+        // 明确指定位置时按普通窗口显示，避免受启动参数影响
+        ShowWindow(hWnd_, SW_SHOWNORMAL);
+    } else {
+        ShowWindow(hWnd_, nCmdShow);
+    }
     UpdateWindow(hWnd_);
     return true;
 }
@@ -229,8 +251,34 @@ void MainWindow::OnCommand(int id, int notifyCode) {
                 if (!already) {
                     EnableWindow(hElevateCombo_, FALSE);
                     UpdateStatusText(L"Requesting elevated privileges...");
+
+                    // 记录当前窗口位置/大小与最大化状态，让提权后的新实例原地显示
+                    WINDOWPLACEMENT wp = { sizeof(wp) };
+                    bool maximized = false;
+                    bool minimized = false;
+                    RECT rc = {};
+                    if (GetWindowPlacement(hWnd_, &wp)) {
+                        maximized = (wp.showCmd == SW_SHOWMAXIMIZED);
+                        minimized = (wp.showCmd == SW_SHOWMINIMIZED);
+                    }
+                    if (maximized || minimized) {
+                        // 最大化时使用普通状态下的窗口矩形，避免把最大化边界当作恢复尺寸
+                        rc = wp.rcNormalPosition;
+                    } else if (!GetWindowRect(hWnd_, &rc)) {
+                        rc = {};
+                    }
+
+                    std::wstring placement;
+                    if (rc.right > rc.left && rc.bottom > rc.top) {
+                        placement = L"--pos " + std::to_wstring(rc.left) + L" "
+                                  + std::to_wstring(rc.top) + L" "
+                                  + std::to_wstring(rc.right - rc.left) + L" "
+                                  + std::to_wstring(rc.bottom - rc.top);
+                        if (maximized) placement += L" --max";
+                    }
+
                     std::wstring err;
-                    if (Elevator::ElevateTo(level, &err)) {
+                    if (Elevator::ElevateTo(level, &err, placement)) {
                         // 新实例已启动，退出当前进程避免出现两个窗口
                         ExitProcess(0);
                     }

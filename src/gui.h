@@ -33,7 +33,8 @@ public:
     MainWindow();
     ~MainWindow();
 
-    bool Create(HINSTANCE hInstance, int nCmdShow);
+    bool Create(HINSTANCE hInstance, int nCmdShow,
+                const RECT* initialRect = nullptr, bool maximized = false);
     int Run();
 
 private:

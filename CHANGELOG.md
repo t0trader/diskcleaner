@@ -41,6 +41,7 @@
 #### GUI（[src/gui.cpp](src/gui.cpp)、[src/gui.h](src/gui.h)）
 - 扫描/清理过程中按钮改为 **Cancel** 并保持可用，支持真正的协作式取消。
 - 提权切换（Admin → SYSTEM / TrustedInstaller）时传递当前窗口位置、大小与最大化状态，新实例在原位置显示，不再跳到屏幕其他位置。
+- 首次打开时窗口居中显示在鼠标所在显示器的工作区。
 - 修复 Clean 按钮清理结束后仍停留在 "Cleaning..." 的问题。
 - 取消后丢弃队列中残留的进度消息，避免旧状态覆盖 "cancelled" 提示。
 - 修复 `Select All` 使用过期内部状态的问题，改为读取复选框实际状态。
@@ -63,6 +64,7 @@
 
 ### 变更与增强
 
+- 新增应用图标：咖啡色渐变背景 + `JCleaner` 字标，提供 16/32/64/128 四种尺寸（小尺寸使用 J 字标），已嵌入 exe、窗口和任务栏；生成脚本位于 [tools/make_icon.py](tools/make_icon.py)。
 - 新增 [src/category_paths.h](src/category_paths.h) / [src/category_paths.cpp](src/category_paths.cpp)：扫描与清理共用同一份类别路径表，消除约 500 行重复代码和两处漂移风险。
 - 类别内路径按大小写不敏感去重，修复 `%TEMP%` 与 `%LOCALAPPDATA%\Temp` 指向同一目录时大小翻倍的问题。
 - 系统级路径改用 `%ProgramData%` / `%SystemDrive%` 展开，不再硬编码 `C:\`。

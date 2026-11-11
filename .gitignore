@@ -20,3 +20,7 @@ Desktop.ini
 *.ilk
 *.exp
 *.lib
+
+# Python
+__pycache__/
+*.pyc

@@ -60,6 +60,11 @@ bool MainWindow::Create(HINSTANCE hInstance, int nCmdShow,
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APP_ICON));
+    wc.hIconSm = static_cast<HICON>(LoadImageW(
+        hInstance, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+        LR_DEFAULTCOLOR));
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
     wc.lpszClassName = MAIN_WINDOW_CLASS;
 
@@ -83,6 +88,21 @@ bool MainWindow::Create(HINSTANCE hInstance, int nCmdShow,
         y = initialRect->top;
         width = initialRect->right - initialRect->left;
         height = initialRect->bottom - initialRect->top;
+    } else {
+        // 首次打开时居中显示在鼠标所在显示器的工作区
+        POINT cursor = { 0, 0 };
+        GetCursorPos(&cursor);
+        HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetMonitorInfoW(monitor, &mi)) {
+            const RECT& work = mi.rcWork;
+            const int workWidth = work.right - work.left;
+            const int workHeight = work.bottom - work.top;
+            x = work.left + (workWidth - width) / 2;
+            y = work.top + (workHeight - height) / 2;
+            if (x < work.left) x = work.left;
+            if (y < work.top) y = work.top;
+        }
     }
 
     hWnd_ = CreateWindowExW(

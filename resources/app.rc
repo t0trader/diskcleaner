@@ -1,8 +1,8 @@
 ﻿#include <windows.h>
 #include <winuser.h>
 
-// Application icon (uncomment when icon file is available)
-// 100 ICON "app.ico"
+// Application icon
+100 ICON "app.ico"
 
 // Version information
 VS_VERSION_INFO VERSIONINFO

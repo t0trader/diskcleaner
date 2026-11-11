@@ -106,6 +106,7 @@
 - **协作式取消**：扫描和清理过程可中断，超大目录遍历支持取消
 - **长路径感知**：启用 `longPathAware`，环境变量展开与文件操作均支持超过 MAX_PATH 的路径
 - 使用 Segoe UI Variable 字体，清晰渲染
+- 应用图标：咖啡色渐变背景 + `JCleaner` 字标，提供 16/32/64/128 多尺寸（小尺寸使用 J 字标），已嵌入 exe、窗口与任务栏
 
 ## 系统要求
 
@@ -170,8 +171,11 @@ diskcleaner/
 │   ├── types.h           # 类型定义
 │   └── utils.h/cpp       # 工具函数
 ├── resources/
+│   ├── app.ico           # 应用图标（16/32/64/128）
 │   ├── app.rc            # 资源文件
 │   └── app.manifest      # 应用清单
+├── tools/
+│   └── make_icon.py      # 图标生成脚本（Python + Pillow）
 ├── CMakeLists.txt        # CMake 配置
 └── README.md             # 说明文档
 ```

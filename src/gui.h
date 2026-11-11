@@ -11,6 +11,8 @@ namespace diskcleaner {
 
 constexpr wchar_t MAIN_WINDOW_CLASS[] = L"DiskCleanerMainWindow";
 
+constexpr int IDI_APP_ICON       = 100;
+
 constexpr int IDC_SCAN_BUTTON   = 1001;
 constexpr int IDC_CLEAN_BUTTON  = 1002;
 constexpr int IDC_SELECT_ALL    = 1003;

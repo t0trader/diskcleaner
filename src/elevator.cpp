@@ -1,16 +1,47 @@
-﻿#include "elevator.h"
-#include <tlhelp32.h>
+#include "elevator.h"
+#include <wtsapi32.h>
 #include <sddl.h>
 #include <shellapi.h>
+#include <filesystem>
+#include <string>
 #include <vector>
 
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wtsapi32.lib")
+#pragma comment(lib, "shell32.lib")
 
 namespace diskcleaner {
 
-// TrustedInstaller service name
+// TrustedInstaller service SID (well-known)
 static const wchar_t* TRUSTED_INSTALLER_SERVICE = L"TrustedInstaller";
-static const wchar_t* TEMP_SERVICE_NAME = L"DiskCleanerElevate";
+static const wchar_t* TRUSTED_INSTALLER_SID     = L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+// 获取当前可执行文件完整路径（支持长路径）
+static std::wstring GetModulePath() {
+    std::wstring buffer(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = GetModuleFileNameW(nullptr, buffer.data(),
+                                       static_cast<DWORD>(buffer.size()));
+        if (len == 0) return L"";
+        if (len < buffer.size()) {
+            buffer.resize(len);
+            return buffer;
+        }
+        buffer.resize(buffer.size() * 2);
+    }
+}
+
+// ============================================
+// Public API
+// ============================================
+
+std::wstring Elevator::GetCurrentLevel() {
+    // TrustedInstaller 令牌的 TokenUser 可能是 SYSTEM，也可能直接是 TI 服务 SID，
+    // 因此先查 TI 组，再查 SYSTEM，避免把 TI 误判为 Admin。
+    if (IsRunAsTrustedInstaller()) return L"TrustedInstaller";
+    if (IsRunAsSystem()) return L"SYSTEM";
+    return L"Admin";
+}
 
 bool Elevator::IsRunAsAdmin() {
     BOOL isAdmin = FALSE;
@@ -44,65 +75,64 @@ bool Elevator::IsRunAsSystem() {
     }
 
     auto pUser = reinterpret_cast<PTOKEN_USER>(buffer.data());
-    SID* sid = reinterpret_cast<SID*>(pUser->User.Sid);
+    PSID sid = pUser->User.Sid;
 
-    // SYSTEM SID: S-1-5-18
     CloseHandle(hToken);
-    return (sid->SubAuthorityCount >= 1 && sid->SubAuthority[0] == SECURITY_LOCAL_SYSTEM_RID);
+    return IsWellKnownSid(sid, WinLocalSystemSid) != FALSE;
 }
 
 bool Elevator::IsRunAsTrustedInstaller() {
-    // Check if running as TrustedInstaller by looking at the token groups
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) return false;
 
-    DWORD size = 0;
-    GetTokenInformation(hToken, TokenGroups, nullptr, 0, &size);
-    if (size == 0) { CloseHandle(hToken); return false; }
-
-    std::vector<BYTE> buffer(size);
-    if (!GetTokenInformation(hToken, TokenGroups, buffer.data(), size, &size)) {
+    PSID tiSid = nullptr;
+    if (!ConvertStringSidToSidW(TRUSTED_INSTALLER_SID, &tiSid)) {
         CloseHandle(hToken);
         return false;
     }
 
-    auto pGroups = reinterpret_cast<PTOKEN_GROUPS>(buffer.data());
-
-    // TrustedInstaller SID: S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464
-    // Simplified check: look for the well-known TrustedInstaller SID
-    LPCWSTR tiSid = L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
-    PSID pTiSid = nullptr;
-    ConvertStringSidToSidW(tiSid, &pTiSid);
-
     bool isTI = false;
-    if (pTiSid) {
-        for (DWORD i = 0; i < pGroups->GroupCount; i++) {
-            if (EqualSid(pGroups->Groups[i].Sid, pTiSid)) {
-                isTI = true;
-                break;
-            }
+
+    // TI 令牌的 TokenUser 可能直接就是 TI 服务 SID
+    DWORD userSize = 0;
+    GetTokenInformation(hToken, TokenUser, nullptr, 0, &userSize);
+    if (userSize != 0) {
+        std::vector<BYTE> userBuf(userSize);
+        if (GetTokenInformation(hToken, TokenUser, userBuf.data(), userSize, &userSize)) {
+            isTI = EqualSid(reinterpret_cast<PTOKEN_USER>(userBuf.data())->User.Sid, tiSid) != FALSE;
         }
-        LocalFree(pTiSid);
     }
 
+    // 否则检查 TokenGroups 中是否包含 TI SID
+    if (!isTI) {
+        DWORD groupsSize = 0;
+        GetTokenInformation(hToken, TokenGroups, nullptr, 0, &groupsSize);
+        if (groupsSize != 0) {
+            std::vector<BYTE> groupsBuf(groupsSize);
+            if (GetTokenInformation(hToken, TokenGroups, groupsBuf.data(), groupsSize, &groupsSize)) {
+                auto groups = reinterpret_cast<PTOKEN_GROUPS>(groupsBuf.data());
+                for (DWORD i = 0; i < groups->GroupCount; i++) {
+                    if (EqualSid(groups->Groups[i].Sid, tiSid)) {
+                        isTI = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    LocalFree(tiSid);
     CloseHandle(hToken);
     return isTI;
 }
 
-ElevateLevel Elevator::GetCurrentLevel() {
-    if (IsRunAsTrustedInstaller()) return ElevateLevel::TrustedInstaller;
-    if (IsRunAsSystem()) return ElevateLevel::System;
-    if (IsRunAsAdmin()) return ElevateLevel::Admin;
-    return ElevateLevel::Admin; // Default
-}
-
 bool Elevator::RequestAdminPrivileges() {
-    wchar_t exePath[MAX_PATH] = {0};
-    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring exePath = GetModulePath();
+    if (exePath.empty()) return false;
 
     SHELLEXECUTEINFOW sei = {sizeof(sei)};
     sei.lpVerb = L"runas";
-    sei.lpFile = exePath;
+    sei.lpFile = exePath.c_str();
     sei.nShow = SW_SHOWNORMAL;
 
     if (!ShellExecuteExW(&sei)) return false;
@@ -132,258 +162,336 @@ bool Elevator::EnablePrivilege(const std::wstring& privilegeName) {
     return result != FALSE;
 }
 
-DWORD Elevator::FindTrustedInstallerPid() {
-    // Open the TrustedInstaller service
-    SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (!hScm) return 0;
+bool Elevator::ElevateTo(ElevateLevel level, std::wstring* err) {
+    // Check if already at target level
+    std::wstring current = GetCurrentLevel();
+    switch (level) {
+        case ElevateLevel::Admin:
+            return IsRunAsAdmin();
 
-    SC_HANDLE hService = OpenServiceW(hScm, TRUSTED_INSTALLER_SERVICE, SERVICE_QUERY_STATUS);
-    if (!hService) {
-        CloseServiceHandle(hScm);
+        case ElevateLevel::System:
+            if (current == L"SYSTEM") return true;
+            return RunAsSystem(GetModulePath(), err);
+
+        case ElevateLevel::TrustedInstaller:
+            if (current == L"TrustedInstaller") return true;
+            return RunAsTrustedInstaller(GetModulePath(), err);
+    }
+    return false;
+}
+
+// ============================================
+// Private helpers
+// ============================================
+
+bool Elevator::EnableSeDebugPrivilege(DWORD& sessionId, std::wstring* err) {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        if (err) *err = L"OpenProcessToken failed";
+        return false;
+    }
+    DWORD len = 0;
+    GetTokenInformation(hToken, TokenSessionId, &sessionId, sizeof(DWORD), &len);
+
+    LUID luid;
+    if (!LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+        CloseHandle(hToken);
+        if (err) *err = L"LookupPrivilegeValue(SE_DEBUG) failed";
+        return false;
+    }
+    TOKEN_PRIVILEGES tp = {};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    // AdjustTokenPrivileges 即使返回 TRUE 也可能只启用部分权限，
+    // 必须先清零 LastError 才能正确判断。
+    SetLastError(ERROR_SUCCESS);
+    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    bool ok = (GetLastError() == ERROR_SUCCESS);
+    CloseHandle(hToken);
+    if (!ok && err) *err = L"AdjustTokenPrivileges(SE_DEBUG) failed - not all assigned";
+    return ok;
+}
+
+DWORD Elevator::LookupWinlogon(DWORD sessionId, std::wstring* err) {
+    PWTS_PROCESS_INFOW pi = nullptr;
+    DWORD count = 0;
+    if (!WTSEnumerateProcessesW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pi, &count) || !pi) {
+        if (err) *err = L"WTSEnumerateProcessesW failed";
         return 0;
     }
-
-    SERVICE_STATUS_PROCESS ssp = {};
-    DWORD bytesNeeded = 0;
     DWORD pid = 0;
-
-    if (QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
-        reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &bytesNeeded)) {
-        if (ssp.dwCurrentState == SERVICE_RUNNING) {
-            pid = ssp.dwProcessId;
+    for (DWORD i = 0; i < count; i++) {
+        if (pi[i].SessionId == sessionId &&
+            _wcsicmp(pi[i].pProcessName, L"winlogon.exe") == 0 &&
+            pi[i].pUserSid != nullptr &&
+            IsWellKnownSid(pi[i].pUserSid, WinLocalSystemSid)) {
+            pid = pi[i].ProcessId;
+            break;
         }
     }
-
-    CloseServiceHandle(hService);
-    CloseServiceHandle(hScm);
+    WTSFreeMemory(pi);
+    if (pid == 0 && err) *err = L"winlogon.exe not found in current session";
     return pid;
 }
 
-HANDLE Elevator::DuplicateTokenFromPid(DWORD pid) {
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-    if (!hProcess) return nullptr;
-
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
-        CloseHandle(hProcess);
-        return nullptr;
-    }
-
-    HANDLE hDupToken = nullptr;
-    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, FALSE};
-    DuplicateTokenEx(hToken,
-        TOKEN_ALL_ACCESS,
-        &sa,
-        SecurityImpersonation,
-        TokenImpersonation,
-        &hDupToken);
-
-    CloseHandle(hToken);
-    CloseHandle(hProcess);
-    return hDupToken;
+void Elevator::EnableOnePrivilege(HANDLE hToken, const wchar_t* name) {
+    LUID luid;
+    if (!LookupPrivilegeValueW(nullptr, name, &luid)) return;
+    TOKEN_PRIVILEGES tp = {};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
 }
 
-bool Elevator::CreateProcessAsTrustedInstaller(const std::wstring& cmdline) {
-    // First, start the TrustedInstaller service if not running
-    SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr,
-        SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
-    if (!hScm) return false;
+void Elevator::EnableAllPrivileges(HANDLE hToken) {
+    DWORD len = 0;
+    GetTokenInformation(hToken, TokenPrivileges, nullptr, 0, &len);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER) return;
+    auto privs = reinterpret_cast<PTOKEN_PRIVILEGES>(HeapAlloc(GetProcessHeap(), 0, len));
+    if (!privs) return;
+    if (GetTokenInformation(hToken, TokenPrivileges, privs, len, &len)) {
+        for (DWORD i = 0; i < privs->PrivilegeCount; i++)
+            privs->Privileges[i].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(hToken, FALSE, privs, 0, nullptr, nullptr);
+    }
+    HeapFree(GetProcessHeap(), 0, privs);
+}
 
-    SC_HANDLE hService = OpenServiceW(hScm, TRUSTED_INSTALLER_SERVICE,
-        SERVICE_START | SERVICE_QUERY_STATUS);
-    if (!hService) {
+bool Elevator::StartTIService(DWORD& pid, std::wstring* err) {
+    SC_HANDLE hScm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!hScm) { if (err) *err = L"OpenSCManager failed"; return false; }
+
+    SC_HANDLE hSvc = OpenServiceW(hScm, TRUSTED_INSTALLER_SERVICE,
+        SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!hSvc) {
         CloseServiceHandle(hScm);
+        if (err) *err = L"OpenService TrustedInstaller failed";
         return false;
     }
 
-    // Start the service if not running
     SERVICE_STATUS_PROCESS ssp = {};
-    DWORD bytesNeeded = 0;
-    QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
-        reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &bytesNeeded);
+    DWORD needed = 0;
+    bool startCalled = false;
+    const ULONGLONG startTick = GetTickCount64();
+    const ULONGLONG timeoutMs = 20000;
 
-    if (ssp.dwCurrentState != SERVICE_RUNNING) {
-        if (!StartServiceW(hService, 0, nullptr)) {
-            CloseServiceHandle(hService);
+    for (;;) {
+        if (!QueryServiceStatusEx(hSvc, SC_STATUS_PROCESS_INFO,
+            reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed))
+            break;
+
+        if (ssp.dwCurrentState == SERVICE_RUNNING) {
+            pid = ssp.dwProcessId;
+            CloseServiceHandle(hSvc);
             CloseServiceHandle(hScm);
-            return false;
+            return true;
         }
-        // Wait for service to start
-        for (int i = 0; i < 30; i++) {
-            Sleep(100);
-            QueryServiceStatusEx(hService, SC_STATUS_PROCESS_INFO,
-                reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &bytesNeeded);
-            if (ssp.dwCurrentState == SERVICE_RUNNING) break;
+
+        if (ssp.dwCurrentState == SERVICE_STOPPED) {
+            if (!startCalled) {
+                StartServiceW(hSvc, 0, nullptr);
+                startCalled = true;
+            }
+            // 服务启动失败会一直停留在 STOPPED，必须靠超时退出，
+            // 否则此处会变成忙等死循环。
+        } else if (ssp.dwCurrentState != SERVICE_STOP_PENDING &&
+                   ssp.dwCurrentState != SERVICE_START_PENDING) {
+            break;
         }
+
+        if (GetTickCount64() - startTick > timeoutMs) break;
+        Sleep(100);
     }
 
-    CloseServiceHandle(hService);
+    CloseServiceHandle(hSvc);
     CloseServiceHandle(hScm);
+    if (err) *err = L"TrustedInstaller service failed to start";
+    return false;
+}
 
-    if (ssp.dwProcessId == 0) return false;
+bool Elevator::LaunchProcess(const std::wstring& exePath, const std::wstring& args,
+                             HANDLE hPrimaryToken, std::wstring* err) {
+    if (exePath.empty()) {
+        if (err) *err = L"Empty executable path";
+        return false;
+    }
 
-    // Duplicate token from TrustedInstaller process
-    HANDLE hTiToken = DuplicateTokenFromPid(ssp.dwProcessId);
-    if (!hTiToken) return false;
+    std::wstring exeDir = std::filesystem::path(exePath).parent_path().wstring();
+    std::wstring cmdLine = L"\"" + exePath + L"\"";
+    if (!args.empty()) cmdLine += L" " + args;
 
-    // Create process with TrustedInstaller token
-    STARTUPINFOW si = {sizeof(si)};
+    STARTUPINFOW si = { sizeof(si) };
+    si.lpDesktop = const_cast<LPWSTR>(L"WinSta0\\Default");
     PROCESS_INFORMATION pi = {};
 
-    // Get current exe path if no cmdline specified
-    std::wstring cmd = cmdline;
-    if (cmd.empty()) {
-        wchar_t exePath[MAX_PATH] = {0};
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        cmd = std::wstring(L"\"") + exePath + L"\" --elevated";
+    // GUI 程序不能使用 CREATE_NEW_CONSOLE，否则会额外弹出一个控制台窗口
+    BOOL ok = ::CreateProcessAsUserW(hPrimaryToken, exePath.c_str(), cmdLine.data(),
+        nullptr, nullptr, FALSE, CREATE_UNICODE_ENVIRONMENT, nullptr,
+        exeDir.empty() ? nullptr : exeDir.c_str(), &si, &pi);
+    if (ok) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else if (err) {
+        *err = L"CreateProcessAsUserW failed, error: " + std::to_wstring(GetLastError());
     }
+    return ok != FALSE;
+}
 
-    // Impersonate the token and create process
-    if (!ImpersonateLoggedOnUser(hTiToken)) {
-        CloseHandle(hTiToken);
+// ============================================
+// SYSTEM elevation (Privexec execute_with_system)
+// ============================================
+
+bool Elevator::RunAsSystem(const std::wstring& exePath, std::wstring* err) {
+    DWORD sessionId = 0;
+    if (!EnableSeDebugPrivilege(sessionId, err)) return false;
+
+    DWORD sysPid = LookupWinlogon(sessionId, err);
+    if (sysPid == 0) return false;
+
+    // Step 1: Open winlogon and duplicate as impersonation token
+    HANDLE hProc = OpenProcess(MAXIMUM_ALLOWED, FALSE, sysPid);
+    if (!hProc) { if (err) *err = L"OpenProcess(winlogon) failed"; return false; }
+
+    HANDLE hExistingToken = nullptr;
+    if (!OpenProcessToken(hProc, MAXIMUM_ALLOWED, &hExistingToken)) {
+        CloseHandle(hProc);
+        if (err) *err = L"OpenProcessToken(winlogon) failed";
+        return false;
+    }
+    CloseHandle(hProc);
+
+    // Step 2: Duplicate as impersonation
+    HANDLE hImp = nullptr;
+    if (!DuplicateTokenEx(hExistingToken, MAXIMUM_ALLOWED, nullptr,
+        SecurityImpersonation, TokenImpersonation, &hImp)) {
+        CloseHandle(hExistingToken);
+        if (err) *err = L"Dup1 failed";
+        return false;
+    }
+    CloseHandle(hExistingToken);
+
+    // Step 3: Enable specific privileges and impersonate
+    EnableOnePrivilege(hImp, SE_TCB_NAME);
+    EnableOnePrivilege(hImp, SE_ASSIGNPRIMARYTOKEN_NAME);
+    EnableOnePrivilege(hImp, SE_INCREASE_QUOTA_NAME);
+
+    if (!SetThreadToken(nullptr, hImp)) {
+        CloseHandle(hImp);
+        if (err) *err = L"SetThreadToken failed";
         return false;
     }
 
-    // Create process in the user's desktop
-    DWORD creationFlags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT;
+    // Step 4: Now impersonating SYSTEM — re-open winlogon token
+    hProc = OpenProcess(MAXIMUM_ALLOWED, FALSE, sysPid);
+    if (!hProc) { RevertToSelf(); CloseHandle(hImp); if (err) *err = L"OpenProcess2 failed"; return false; }
 
-    // We need to use CreateProcessWithTokenW for proper token assignment
-    BOOL result = CreateProcessWithTokenW(
-        hTiToken,
-        LOGON_WITH_PROFILE,
-        nullptr,
-        const_cast<LPWSTR>(cmd.c_str()),
-        creationFlags,
-        nullptr,
-        nullptr,
-        &si,
-        &pi
-    );
+    HANDLE hToken2 = nullptr;
+    if (!OpenProcessToken(hProc, MAXIMUM_ALLOWED, &hToken2)) {
+        CloseHandle(hProc); RevertToSelf(); CloseHandle(hImp);
+        if (err) *err = L"OpenProcessToken2 failed"; return false;
+    }
+    CloseHandle(hProc);
+
+    // Step 5: Duplicate as PRIMARY
+    HANDLE hPrimary = nullptr;
+    if (!DuplicateTokenEx(hToken2, TOKEN_ALL_ACCESS, nullptr,
+        SecurityImpersonation, TokenPrimary, &hPrimary)) {
+        CloseHandle(hToken2); RevertToSelf(); CloseHandle(hImp);
+        if (err) *err = L"Dup2 failed"; return false;
+    }
+    CloseHandle(hToken2);
+
+    // Step 6: Set session ID
+    SetTokenInformation(hPrimary, TokenSessionId, &sessionId, sizeof(sessionId));
+
+    // Step 7: Launch WHILE STILL IMPERSONATING SYSTEM
+    bool ok = LaunchProcess(exePath, L"--elevated", hPrimary, err);
 
     RevertToSelf();
-    CloseHandle(hTiToken);
-
-    if (result) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        return true;
-    }
-
-    // Fallback: try using CreateProcessAsUser
-    // This requires SE_ASSIGNPRIMARYTOKEN_NAME and SE_INCREASE_QUOTA_NAME privileges
-    EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
-    EnablePrivilege(L"IncreaseQuotaPrivilege");
-
-    HANDLE hPrimaryToken = nullptr;
-    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, FALSE};
-    if (DuplicateTokenEx(hTiToken, TOKEN_ALL_ACCESS, &sa,
-        SecurityIdentification, TokenPrimary, &hPrimaryToken)) {
-        result = CreateProcessAsUserW(
-            hPrimaryToken,
-            nullptr,
-            const_cast<LPWSTR>(cmd.c_str()),
-            nullptr, nullptr,
-            FALSE, creationFlags, nullptr, nullptr,
-            &si, &pi
-        );
-        CloseHandle(hPrimaryToken);
-    }
-
-    if (result) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-    }
-
-    return result != FALSE;
+    CloseHandle(hImp);
+    CloseHandle(hPrimary);
+    return ok;
 }
 
-bool Elevator::CreateProcessAsSystem(const std::wstring& cmdline) {
-    // Find SYSTEM process (winlogon.exe, csrss.exe, or services.exe)
-    DWORD systemPid = 0;
+// ============================================
+// TrustedInstaller elevation (Privexec execute_with_ti)
+// ============================================
 
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnapshot == INVALID_HANDLE_VALUE) return false;
+bool Elevator::RunAsTrustedInstaller(const std::wstring& exePath, std::wstring* err) {
+    DWORD sessionId = 0;
+    if (!EnableSeDebugPrivilege(sessionId, err)) return false;
 
-    PROCESSENTRY32W pe = {sizeof(pe)};
-    if (Process32FirstW(hSnapshot, &pe)) {
-        do {
-            // Look for winlogon.exe or services.exe (runs as SYSTEM)
-            if (_wcsicmp(pe.szExeFile, L"winlogon.exe") == 0 ||
-                _wcsicmp(pe.szExeFile, L"services.exe") == 0) {
-                systemPid = pe.th32ProcessID;
-                break;
-            }
-        } while (Process32NextW(hSnapshot, &pe));
+    DWORD sysPid = LookupWinlogon(sessionId, err);
+    if (sysPid == 0) return false;
+
+    // Step 1: Impersonate as SYSTEM with ALL privileges
+    HANDLE hProc = OpenProcess(MAXIMUM_ALLOWED, FALSE, sysPid);
+    if (!hProc) { if (err) *err = L"OpenProcess(winlogon) failed"; return false; }
+
+    HANDLE hExistingToken = nullptr;
+    if (!OpenProcessToken(hProc, MAXIMUM_ALLOWED, &hExistingToken)) {
+        CloseHandle(hProc);
+        if (err) *err = L"OpenProcessToken(winlogon) failed";
+        return false;
     }
-    CloseHandle(hSnapshot);
+    CloseHandle(hProc);
 
-    if (systemPid == 0) return false;
+    HANDLE hImp = nullptr;
+    if (!DuplicateTokenEx(hExistingToken, MAXIMUM_ALLOWED, nullptr,
+        SecurityImpersonation, TokenImpersonation, &hImp)) {
+        CloseHandle(hExistingToken);
+        if (err) *err = L"Dup(winlogon) failed";
+        return false;
+    }
+    CloseHandle(hExistingToken);
 
-    // Duplicate token
-    HANDLE hSysToken = DuplicateTokenFromPid(systemPid);
-    if (!hSysToken) return false;
+    // Enable ALL privileges (Privexec: pv=nullptr means enable all)
+    EnableAllPrivileges(hImp);
 
-    // Enable debug privilege for token manipulation
-    EnablePrivilege(L"SeDebugPrivilege");
-    EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
-    EnablePrivilege(L"IncreaseQuotaPrivilege");
-
-    // Create primary token
-    HANDLE hPrimaryToken = nullptr;
-    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, FALSE};
-    if (!DuplicateTokenEx(hSysToken, TOKEN_ALL_ACCESS, &sa,
-        SecurityIdentification, TokenPrimary, &hPrimaryToken)) {
-        CloseHandle(hSysToken);
+    if (!SetThreadToken(nullptr, hImp)) {
+        CloseHandle(hImp);
+        if (err) *err = L"SetThreadToken failed";
         return false;
     }
 
-    // Get current exe path if no cmdline specified
-    std::wstring cmd = cmdline;
-    if (cmd.empty()) {
-        wchar_t exePath[MAX_PATH] = {0};
-        GetModuleFileNameW(nullptr, exePath, MAX_PATH);
-        cmd = std::wstring(L"\"") + exePath + L"\" --elevated";
+    // Step 2: Start TrustedInstaller service (now running as SYSTEM)
+    DWORD tiPid = 0;
+    if (!StartTIService(tiPid, err)) {
+        RevertToSelf(); CloseHandle(hImp);
+        return false;
     }
 
-    STARTUPINFOW si = {sizeof(si)};
-    PROCESS_INFORMATION pi = {};
-    DWORD creationFlags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT;
+    // Step 3: Duplicate TI process token
+    HANDLE hTiProc = OpenProcess(MAXIMUM_ALLOWED, FALSE, tiPid);
+    if (!hTiProc) { RevertToSelf(); CloseHandle(hImp); if (err) *err = L"OpenProcess(TI) failed"; return false; }
 
-    BOOL result = CreateProcessAsUserW(
-        hPrimaryToken,
-        nullptr,
-        const_cast<LPWSTR>(cmd.c_str()),
-        nullptr, nullptr,
-        FALSE, creationFlags, nullptr, nullptr,
-        &si, &pi
-    );
-
-    CloseHandle(hPrimaryToken);
-    CloseHandle(hSysToken);
-
-    if (result) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    HANDLE hTiToken = nullptr;
+    if (!OpenProcessToken(hTiProc, MAXIMUM_ALLOWED, &hTiToken)) {
+        CloseHandle(hTiProc); RevertToSelf(); CloseHandle(hImp);
+        if (err) *err = L"OpenProcessToken(TI) failed"; return false;
     }
+    CloseHandle(hTiProc);
 
-    return result != FALSE;
-}
-
-bool Elevator::ElevateTo(ElevateLevel level, const std::wstring& cmdline) {
-    switch (level) {
-        case ElevateLevel::Admin:
-            if (IsRunAsAdmin()) return true;
-            return RequestAdminPrivileges();
-
-        case ElevateLevel::System:
-            if (IsRunAsSystem()) return true;
-            return CreateProcessAsSystem(cmdline);
-
-        case ElevateLevel::TrustedInstaller:
-            if (IsRunAsTrustedInstaller()) return true;
-            return CreateProcessAsTrustedInstaller(cmdline);
+    HANDLE hPrimary = nullptr;
+    if (!DuplicateTokenEx(hTiToken, MAXIMUM_ALLOWED, nullptr,
+        SecurityImpersonation, TokenPrimary, &hPrimary)) {
+        CloseHandle(hTiToken); RevertToSelf(); CloseHandle(hImp);
+        if (err) *err = L"DuplicateTokenEx(TI) failed"; return false;
     }
-    return false;
+    CloseHandle(hTiToken);
+
+    // Step 4: Set session ID
+    SetTokenInformation(hPrimary, TokenSessionId, &sessionId, sizeof(sessionId));
+
+    // Step 5: Launch WHILE STILL IMPERSONATING SYSTEM
+    bool ok = LaunchProcess(exePath, L"--elevated", hPrimary, err);
+
+    RevertToSelf();
+    CloseHandle(hImp);
+    CloseHandle(hPrimary);
+    return ok;
 }
 
 } // namespace diskcleaner

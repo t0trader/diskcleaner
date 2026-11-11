@@ -21,6 +21,7 @@ public:
     bool IsCleaning() const { return cleaning_.load(); }
     int64_t GetBytesFreed() const { return bytesFreed_.load(); }
     int64_t GetFilesDeleted() const { return filesDeleted_.load(); }
+    int64_t GetFilesFailed() const { return filesFailed_.load(); }
 
     void SetProgressCallback(CleanupProgressCallback callback) { std::lock_guard<std::mutex> lock(mutex_); progressCallback_ = std::move(callback); }
     void SetCompleteCallback(CleanupCompleteCallback callback) { std::lock_guard<std::mutex> lock(mutex_); completeCallback_ = std::move(callback); }
@@ -35,6 +36,7 @@ private:
     std::atomic<bool> stopRequested_{false};
     std::atomic<int64_t> bytesFreed_{0};
     std::atomic<int64_t> filesDeleted_{0};
+    std::atomic<int64_t> filesFailed_{0};
     std::thread cleanupThread_;
     std::mutex mutex_;
 

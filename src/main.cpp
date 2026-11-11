@@ -3,16 +3,14 @@
 #include "gui.h"
 #include "elevator.h"
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR lpCmdLine, int nCmdShow) {
-    // Parse command line for --elevated flag
-    std::wstring cmdLine = lpCmdLine ? lpCmdLine : L"";
-    bool isElevated = (cmdLine.find(L"--elevated") != std::wstring::npos);
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+    // 已提权实例直接运行。TrustedInstaller 令牌不一定包含 Administrators 组，
+    // 必须单独判断，否则会反复触发提权。
+    const bool elevated = diskcleaner::Elevator::IsRunAsAdmin() ||
+                          diskcleaner::Elevator::IsRunAsSystem() ||
+                          diskcleaner::Elevator::IsRunAsTrustedInstaller();
 
-    // Get current privilege level
-    auto level = diskcleaner::Elevator::GetCurrentLevel();
-
-    // If not elevated and not admin, request admin
-    if (!isElevated && !diskcleaner::Elevator::IsRunAsAdmin()) {
+    if (!elevated) {
         if (!diskcleaner::Elevator::RequestAdminPrivileges()) {
             MessageBoxW(nullptr,
                 L"This program requires administrator privileges.",

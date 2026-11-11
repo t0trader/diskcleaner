@@ -35,7 +35,6 @@ public:
 private:
     void ScanWorker();
     CleanupItem ScanCategory(CleanupCategory category);
-    std::vector<std::wstring> GetCategoryPaths(CleanupCategory category);
 
     std::vector<CleanupItem> results_;
     mutable std::mutex resultsMutex_;

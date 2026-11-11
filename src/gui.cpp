@@ -14,6 +14,28 @@ static HMENU MakeMenuID(int id) {
     return reinterpret_cast<HMENU>(static_cast<INT_PTR>(id));
 }
 
+// 列表列宽（96 DPI 基准），实际使用时按当前 DPI 缩放
+static const int kColumnWidths[] = {180, 60, 280, 100, 80};
+
+// 丢弃已入队但未处理的进度消息，避免取消后旧进度覆盖状态文本
+static void DrainProgressMessages(HWND hwnd, UINT msgId) {
+    MSG msg;
+    while (PeekMessageW(&msg, hwnd, msgId, msgId, PM_REMOVE)) {}
+}
+
+// 不产生文件大小但确实执行系统操作的类别（大小可能为 0 仍允许清理）
+static bool IsCommandCleanup(CleanupCategory category) {
+    switch (category) {
+        case CleanupCategory::HibernationFile:
+        case CleanupCategory::EventLogsWEvtUtil:
+        case CleanupCategory::FlushDNS:
+        case CleanupCategory::CrashDumpSettings:
+            return true;
+        default:
+            return false;
+    }
+}
+
 MainWindow::MainWindow() {
     scanner_ = std::make_unique<Scanner>();
     cleaner_ = std::make_unique<Cleaner>();
@@ -42,13 +64,18 @@ bool MainWindow::Create(HINSTANCE hInstance, int nCmdShow) {
 
     if (!RegisterClassExW(&wc)) return false;
 
+    // 按系统 DPI 缩放初始窗口尺寸，避免高 DPI 下界面过小
+    UINT sysDpi = GetDpiForSystem();
+    if (sysDpi == 0) sysDpi = 96;
+
     hWnd_ = CreateWindowExW(
         WS_EX_APPWINDOW,
         MAIN_WINDOW_CLASS,
         L"Disk Cleaner - Windows 11",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        800, 600,
+        MulDiv(800, static_cast<int>(sysDpi), 96),
+        MulDiv(600, static_cast<int>(sysDpi), 96),
         nullptr, nullptr,
         hInstance, this
     );
@@ -110,26 +137,31 @@ LRESULT MainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_SCAN_PROGRESS: {
             // wParam = category index, lParam = unused
             int catIdx = static_cast<int>(wParam);
+            int total = static_cast<int>(CleanupCategory::Count);
             std::wstring status = L"Scanning: " + Scanner::GetCategoryName(static_cast<CleanupCategory>(catIdx));
             UpdateStatusText(status);
-            SendMessageW(hProgressBar_, PBM_SETPOS, catIdx * 100 / static_cast<int>(CleanupCategory::Count), 0);
+            int progress = total > 0 ? catIdx * 100 / total : 0;
+            if (progress > 100) progress = 100;
+            if (progress < 0) progress = 0;
+            SendMessageW(hProgressBar_, PBM_SETPOS, progress, 0);
             return 0;
         }
         case WM_SCAN_COMPLETE: {
-            UpdateButtons(false);
+            UpdateActionButtons();
             UpdateListView();
             SendMessageW(hProgressBar_, PBM_SETPOS, 100, 0);
             int64_t totalSize = scanner_->GetTotalSize();
             std::wstring status = L"Scan complete - " + FormatBytes(totalSize) + L" recoverable";
             UpdateStatusText(status);
-            EnableWindow(hCleanButton_, totalSize > 0);
             return 0;
         }
         case WM_CLEAN_PROGRESS: {
             int64_t bytesFreed = static_cast<int64_t>(wParam);
-            int64_t totalSize = scanner_->GetTotalSize();
-            if (totalSize > 0) {
-                int progress = static_cast<int>(bytesFreed * 100 / totalSize);
+            // 使用清理开始时缓存的总量，避免每个进度消息都遍历/加锁全部扫描结果
+            if (cleanTotalSize_ > 0) {
+                int progress = static_cast<int>(bytesFreed * 100 / cleanTotalSize_);
+                if (progress > 100) progress = 100;
+                if (progress < 0) progress = 0;
                 SendMessageW(hProgressBar_, PBM_SETPOS, progress, 0);
             }
             std::wstring sizeText = L"Freed: " + FormatBytes(bytesFreed);
@@ -139,21 +171,30 @@ LRESULT MainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_CLEAN_COMPLETE: {
             int64_t bytesFreed = static_cast<int64_t>(wParam);
             int64_t filesDeleted = static_cast<int64_t>(lParam);
+            int64_t filesFailed = cleaner_->GetFilesFailed();
             SendMessageW(hProgressBar_, PBM_SETPOS, 100, 0);
             std::wstring status = L"Done - Freed " + FormatBytes(bytesFreed) +
                 L", deleted " + std::to_wstring(filesDeleted) + L" files";
+            if (filesFailed > 0) {
+                status += L", skipped " + std::to_wstring(filesFailed) + L" (in use)";
+            }
+            if (restorePointId_ != 0) {
+                status += L" (restore point created)";
+            }
             UpdateStatusText(status);
-            // Rescan
-            scanner_->StartScan();
             MessageBoxW(hWnd_, status.c_str(), L"Cleanup Complete", MB_OK | MB_ICONINFORMATION);
+            // 重新扫描（复用 OnScanClick 以正确更新按钮状态）
+            OnScanClick();
             return 0;
         }
     }
-    return DefWindowProcW(hWnd_, msg, wParam, lParam);
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 bool MainWindow::OnCreate(HWND hWnd) {
     hWnd_ = hWnd;
+    UINT dpi = GetDpiForWindow(hWnd);
+    dpi_ = dpi != 0 ? static_cast<int>(dpi) : 96;
     CreateFonts();
     CreateControls();
     return true;
@@ -165,6 +206,7 @@ void MainWindow::OnDestroy() {
 }
 
 void MainWindow::OnSize(int width, int height) {
+    if (width <= 0 || height <= 0) return;  // 最小化时避免出现负尺寸
     UpdateLayout(width, height);
 }
 
@@ -173,33 +215,62 @@ void MainWindow::OnCommand(int id, int notifyCode) {
         case IDC_SCAN_BUTTON:   OnScanClick(); break;
         case IDC_CLEAN_BUTTON:  OnCleanClick(); break;
         case IDC_SELECT_ALL:    OnSelectAllClick(); break;
+        case IDC_RESTORE_BUTTON: OnRestoreClick(); break;
         case IDC_ELEVATE_COMBO:
             if (notifyCode == CBN_SELCHANGE) {
                 int sel = static_cast<int>(SendMessageW(hElevateCombo_, CB_GETCURSEL, 0, 0));
-                if (sel == 1) {
-                    // SYSTEM
-                    Elevator::ElevateTo(ElevateLevel::System);
-                } else if (sel == 2) {
-                    // TrustedInstaller
-                    Elevator::ElevateTo(ElevateLevel::TrustedInstaller);
+                if (sel != 1 && sel != 2) break;
+
+                ElevateLevel level = (sel == 1) ? ElevateLevel::System
+                                                : ElevateLevel::TrustedInstaller;
+                bool already = (sel == 1) ? Elevator::IsRunAsSystem()
+                                          : Elevator::IsRunAsTrustedInstaller();
+
+                if (!already) {
+                    EnableWindow(hElevateCombo_, FALSE);
+                    UpdateStatusText(L"Requesting elevated privileges...");
+                    std::wstring err;
+                    if (Elevator::ElevateTo(level, &err)) {
+                        // 新实例已启动，退出当前进程避免出现两个窗口
+                        ExitProcess(0);
+                    }
+                    EnableWindow(hElevateCombo_, TRUE);
+                    std::wstring msg = L"Failed to elevate privileges.";
+                    if (!err.empty()) msg += L"\n\n" + err;
+                    MessageBoxW(hWnd_, msg.c_str(), L"Elevation Failed",
+                                MB_OK | MB_ICONERROR);
                 }
+
+                // 恢复到当前实际权限级别
+                std::wstring current = Elevator::GetCurrentLevel();
+                int selIdx = 0;
+                if (current == L"SYSTEM") selIdx = 1;
+                else if (current == L"TrustedInstaller") selIdx = 2;
+                SendMessageW(hElevateCombo_, CB_SETCURSEL, selIdx, 0);
+                UpdateStatusText(L"Ready");
             }
             break;
     }
 }
 
 void MainWindow::OnNotify(NMHDR* pNMHDR) {
-    if (pNMHDR->idFrom == IDC_LISTVIEW && pNMHDR->code == LVN_ITEMCHANGED) {
-        auto pNMListView = reinterpret_cast<NMLISTVIEW*>(pNMHDR);
-        if (pNMListView->uChanged & LVIF_STATE) {
-            auto results = scanner_->GetResults();
-            if (pNMListView->iItem >= 0 && pNMListView->iItem < static_cast<int>(results.size())) {
-                bool checked = (ListView_GetCheckState(hListView_, pNMListView->iItem) != 0);
-                scanner_->SetItemEnabled(results[pNMListView->iItem].category, checked);
-                UpdateSizeText(scanner_->GetTotalSize());
-            }
-        }
+    if (pNMHDR->idFrom != IDC_LISTVIEW || pNMHDR->code != LVN_ITEMCHANGED) return;
+    // 列表重建/批量勾选期间由代码主动同步，忽略控件回传的通知，避免覆盖扫描结果
+    if (updatingList_) return;
+
+    auto pNMListView = reinterpret_cast<NMLISTVIEW*>(pNMHDR);
+    if ((pNMListView->uChanged & LVIF_STATE) == 0) return;
+    // 只关心勾选状态变化，忽略选中/焦点变化
+    if (((pNMListView->uOldState ^ pNMListView->uNewState) & LVIS_STATEIMAGEMASK) == 0) {
+        return;
     }
+
+    const int index = pNMListView->iItem;
+    if (index < 0 || index >= static_cast<int>(CleanupCategory::Count)) return;
+
+    bool checked = ListView_GetCheckState(hListView_, index) != 0;
+    scanner_->SetItemEnabled(static_cast<CleanupCategory>(index), checked);
+    UpdateSizeText(scanner_->GetTotalSize());
 }
 
 void MainWindow::OnDpiChanged(int dpi, RECT* pRect) {
@@ -220,6 +291,12 @@ void MainWindow::OnDpiChanged(int dpi, RECT* pRect) {
         SendMessageW(hSizeText_, WM_SETFONT, WPARAM(hFont_), TRUE);
         SendMessageW(hElevateLabel_, WM_SETFONT, WPARAM(hFont_), TRUE);
         SendMessageW(hElevateCombo_, WM_SETFONT, WPARAM(hFont_), TRUE);
+        SendMessageW(hRestoreButton_, WM_SETFONT, WPARAM(hFontBold_), TRUE);
+    }
+
+    // 列宽随 DPI 重新缩放
+    for (int i = 0; i < static_cast<int>(_countof(kColumnWidths)); i++) {
+        ListView_SetColumnWidth(hListView_, i, Scale(kColumnWidths[i]));
     }
 
     SetWindowPos(hWnd_, nullptr, pRect->left, pRect->top,
@@ -238,8 +315,9 @@ void MainWindow::CreateFonts() {
 
     hFont_ = CreateFontIndirectW(&lf);
 
-    // Bold version for buttons
-    lf.lfWeight = FW_SEMIBOLD;
+    // 按钮字体：14pt 加粗，更醒目、更易读
+    lf.lfHeight = -MulDiv(14, dpi_, 72);
+    lf.lfWeight = FW_BOLD;
     hFontBold_ = CreateFontIndirectW(&lf);
 }
 
@@ -260,6 +338,7 @@ void MainWindow::CreateControls() {
         SendMessageW(hSizeText_, WM_SETFONT, WPARAM(hFont_), TRUE);
         SendMessageW(hElevateLabel_, WM_SETFONT, WPARAM(hFont_), TRUE);
         SendMessageW(hElevateCombo_, WM_SETFONT, WPARAM(hFont_), TRUE);
+        SendMessageW(hRestoreButton_, WM_SETFONT, WPARAM(hFontBold_), TRUE);
     }
 
     RECT rc;
@@ -283,27 +362,27 @@ void MainWindow::CreateListView() {
     col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
 
     col.pszText = const_cast<LPWSTR>(L"Category");
-    col.cx = 180;
+    col.cx = Scale(kColumnWidths[0]);
     col.fmt = LVCFMT_LEFT;
     ListView_InsertColumn(hListView_, 0, &col);
 
     col.pszText = const_cast<LPWSTR>(L"Risk");
-    col.cx = 60;
+    col.cx = Scale(kColumnWidths[1]);
     col.fmt = LVCFMT_CENTER;
     ListView_InsertColumn(hListView_, 1, &col);
 
     col.pszText = const_cast<LPWSTR>(L"Description");
-    col.cx = 280;
+    col.cx = Scale(kColumnWidths[2]);
     col.fmt = LVCFMT_LEFT;
     ListView_InsertColumn(hListView_, 2, &col);
 
     col.pszText = const_cast<LPWSTR>(L"Size");
-    col.cx = 100;
+    col.cx = Scale(kColumnWidths[3]);
     col.fmt = LVCFMT_RIGHT;
     ListView_InsertColumn(hListView_, 3, &col);
 
     col.pszText = const_cast<LPWSTR>(L"Files");
-    col.cx = 80;
+    col.cx = Scale(kColumnWidths[4]);
     col.fmt = LVCFMT_RIGHT;
     ListView_InsertColumn(hListView_, 4, &col);
 }
@@ -334,6 +413,15 @@ void MainWindow::CreateButtons() {
         hInstance_, nullptr
     );
     SendMessageW(hSelectAllCheck_, BM_SETCHECK, BST_CHECKED, 0);
+
+    // 系统还原按钮（一键回滚保护）
+    hRestoreButton_ = CreateWindowExW(
+        0, WC_BUTTONW, L"System Restore",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 0, 0,
+        hWnd_, MakeMenuID(IDC_RESTORE_BUTTON),
+        hInstance_, nullptr
+    );
 }
 
 void MainWindow::CreateProgressBar() {
@@ -391,78 +479,95 @@ void MainWindow::CreateElevationCombo() {
     SendMessageW(hElevateCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"TrustedInstaller"));
 
     // Set current level
-    auto level = Elevator::GetCurrentLevel();
+    std::wstring level = Elevator::GetCurrentLevel();
     int selIdx = 0;
-    switch (level) {
-        case ElevateLevel::Admin: selIdx = 0; break;
-        case ElevateLevel::System: selIdx = 1; break;
-        case ElevateLevel::TrustedInstaller: selIdx = 2; break;
-    }
+    if (level == L"SYSTEM") selIdx = 1;
+    else if (level == L"TrustedInstaller") selIdx = 2;
     SendMessageW(hElevateCombo_, CB_SETCURSEL, selIdx, 0);
 }
 
 void MainWindow::UpdateLayout(int width, int height) {
-    const int padding = 10;
-    const int buttonHeight = 35;
-    const int buttonWidth = 120;
-    const int statusHeight = 30;
-    const int progressHeight = 25;
+    const int padding = Scale(10);
+    const int buttonHeight = Scale(40);
+    const int buttonWidth = Scale(140);
+    const int restoreButtonWidth = Scale(180);  // System Restore 文字较长，单独加宽
+    const int statusHeight = Scale(30);
+    const int progressHeight = Scale(25);
+    const int rowHeight = Scale(20);
+    const int comboWidth = Scale(180);
+    const int labelWidth = Scale(70);
+    const int contentWidth = width - padding * 2 > Scale(50)
+        ? width - padding * 2 : Scale(50);
 
     int y = padding;
 
     // Top row: select all + elevation combo
-    MoveWindow(hSelectAllCheck_, padding, y, 100, 20, TRUE);
-    MoveWindow(hElevateLabel_, width - padding - 250, y, 70, 20, TRUE);
-    MoveWindow(hElevateCombo_, width - padding - 180, y, 180, 25, TRUE);
-    y += 30;
+    MoveWindow(hSelectAllCheck_, padding, y, Scale(100), rowHeight, TRUE);
+    MoveWindow(hElevateLabel_, width - padding - Scale(250), y, labelWidth, rowHeight, TRUE);
+    MoveWindow(hElevateCombo_, width - padding - comboWidth, y, comboWidth, Scale(25), TRUE);
+    y += Scale(30);
 
     // List view
     int listHeight = height - y - statusHeight - progressHeight - buttonHeight - padding * 4;
-    if (listHeight < 100) listHeight = 100;
-    MoveWindow(hListView_, padding, y, width - padding * 2, listHeight, TRUE);
+    if (listHeight < Scale(100)) listHeight = Scale(100);
+    MoveWindow(hListView_, padding, y, contentWidth, listHeight, TRUE);
     y += listHeight + padding;
 
     // Progress bar
-    MoveWindow(hProgressBar_, padding, y, width - padding * 2, progressHeight, TRUE);
+    MoveWindow(hProgressBar_, padding, y, contentWidth, progressHeight, TRUE);
     y += progressHeight + padding;
 
     // Status row
-    MoveWindow(hStatusText_, padding, y, width - padding * 2 - 200, statusHeight, TRUE);
-    MoveWindow(hSizeText_, width - padding - 200, y, 200, statusHeight, TRUE);
+    int statusWidth = contentWidth - Scale(200);
+    if (statusWidth < Scale(100)) statusWidth = Scale(100);
+    MoveWindow(hStatusText_, padding, y, statusWidth, statusHeight, TRUE);
+    MoveWindow(hSizeText_, width - padding - Scale(200), y, Scale(200), statusHeight, TRUE);
     y += statusHeight + padding;
 
-    // Buttons
+    // Buttons: System Restore 在左（单独加宽），Scan/Clean 在右
+    MoveWindow(hRestoreButton_, padding, y, restoreButtonWidth, buttonHeight, TRUE);
     int buttonX = width - padding - buttonWidth * 2 - padding;
+    if (buttonX < padding) buttonX = padding;
     MoveWindow(hScanButton_, buttonX, y, buttonWidth, buttonHeight, TRUE);
     MoveWindow(hCleanButton_, buttonX + buttonWidth + padding, y, buttonWidth, buttonHeight, TRUE);
 }
 
 void MainWindow::UpdateListView() {
+    // 重建列表期间抑制 LVN_ITEMCHANGED，避免控件回传的中间状态覆盖扫描结果
+    updatingList_ = true;
     ListView_DeleteAllItems(hListView_);
     auto results = scanner_->GetResults();
     for (int i = 0; i < static_cast<int>(results.size()); i++) {
         SetListViewItem(i, results[i]);
     }
+    updatingList_ = false;
     UpdateSizeText(scanner_->GetTotalSize());
 }
 
-void MainWindow::UpdateButtons(bool scanning) {
-    EnableWindow(hScanButton_, !scanning);
-    SetWindowTextW(hScanButton_, scanning ? L"Scanning..." : L"Scan");
+void MainWindow::UpdateActionButtons() {
+    const bool scanning = scanner_->IsScanning();
+    const bool cleaning = cleaner_->IsCleaning();
 
-    if (!scanning) {
+    SetWindowTextW(hScanButton_, scanning ? L"Cancel" : L"Scan");
+    SetWindowTextW(hCleanButton_, cleaning ? L"Cancel" : L"Clean");
+
+    // 扫描/清理过程中按钮变为“取消”并保持可用；两者互斥
+    EnableWindow(hScanButton_, !cleaning);
+    EnableWindow(hRestoreButton_, !scanning && !cleaning);
+    EnableWindow(hElevateCombo_, !scanning && !cleaning);
+
+    bool hasItems = cleaning;  // 清理过程中保持“取消”可用
+    if (!hasItems) {
         auto results = scanner_->GetResults();
-        bool hasItems = false;
         for (const auto& item : results) {
-            if (item.enabled && item.size > 0) {
+            if (!item.enabled || !item.scanned) continue;
+            if (item.size > 0 || IsCommandCleanup(item.category)) {
                 hasItems = true;
                 break;
             }
         }
-        EnableWindow(hCleanButton_, hasItems);
-    } else {
-        EnableWindow(hCleanButton_, FALSE);
     }
+    EnableWindow(hCleanButton_, hasItems && !scanning);
 }
 
 void MainWindow::UpdateStatusText(const std::wstring& text) {
@@ -477,11 +582,13 @@ void MainWindow::UpdateSizeText(int64_t totalSize) {
 void MainWindow::OnScanClick() {
     if (scanner_->IsScanning()) {
         scanner_->StopScan();
-        UpdateButtons(false);
+        DrainProgressMessages(hWnd_, WM_SCAN_PROGRESS);
+        UpdateActionButtons();
         UpdateStatusText(L"Scan cancelled");
         return;
     }
-    UpdateButtons(true);
+    if (cleaner_->IsCleaning()) return;  // 清理期间不允许启动扫描
+
     UpdateStatusText(L"Scanning...");
     SendMessageW(hProgressBar_, PBM_SETPOS, 0, 0);
 
@@ -494,27 +601,76 @@ void MainWindow::OnScanClick() {
     });
 
     scanner_->StartScan();
+    UpdateActionButtons();
 }
 
 void MainWindow::OnCleanClick() {
     if (cleaner_->IsCleaning()) {
         cleaner_->StopCleanup();
-        UpdateButtons(false);
+        DrainProgressMessages(hWnd_, WM_CLEAN_PROGRESS);
+        UpdateActionButtons();
         UpdateStatusText(L"Cleanup cancelled");
         return;
     }
+    if (scanner_->IsScanning()) return;  // 扫描期间不允许清理
 
     auto results = scanner_->GetResults();
     int64_t totalSize = scanner_->GetTotalSize();
-    std::wstring msg = L"Clean " + FormatBytes(totalSize) + L" of junk files?";
+    cleanTotalSize_ = totalSize;
+
+    // Count cleanable items (ignore empty file-based categories like Cleaner does)
+    int cleanableCount = 0;
+    std::wstring highRiskList;
+    int highRiskCount = 0;
+    for (const auto& item : results) {
+        if (!item.enabled || !item.scanned) continue;
+        if (item.size == 0 && !IsCommandCleanup(item.category)) continue;
+        cleanableCount++;
+        if (item.risk == RiskLevel::High ||
+            item.category == CleanupCategory::CrashDumpSettings) {
+            highRiskList += L"\n  - " + item.name;
+            highRiskCount++;
+        }
+    }
+
+    std::wstring msg;
+    if (totalSize > 0) {
+        msg = L"Clean " + FormatBytes(totalSize) + L" from " + std::to_wstring(cleanableCount) + L" categories?";
+    } else {
+        msg = L"Clean " + std::to_wstring(cleanableCount) + L" categories (some have 0 estimated size)?";
+    }
+    if (highRiskCount > 0) {
+        msg += L"\n\nHigh-risk / system-setting categories selected:" + highRiskList;
+    }
     int ret = MessageBoxW(hWnd_, msg.c_str(), L"Confirm Cleanup",
         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
     if (ret != IDYES) return;
 
-    UpdateButtons(true);
-    SetWindowTextW(hCleanButton_, L"Cleaning...");
-    UpdateStatusText(L"Cleaning...");
+    // 清理前自动创建系统还原点，作为故障回滚保护
+    EnableWindow(hScanButton_, FALSE);
+    EnableWindow(hCleanButton_, FALSE);
+    EnableWindow(hRestoreButton_, FALSE);
+    SetWindowTextW(hScanButton_, L"Scan");
+    SetWindowTextW(hCleanButton_, L"Preparing...");
+    restorePointId_ = 0;
+    UpdateStatusText(L"Creating system restore point...");
     SendMessageW(hProgressBar_, PBM_SETPOS, 0, 0);
+    UpdateWindow(hWnd_);  // 还原点创建可能耗时，先刷新界面
+
+    restorePointId_ = CreateSystemRestorePoint(L"DiskCleaner before cleanup");
+    if (restorePointId_ == 0) {
+        int retry = MessageBoxW(hWnd_,
+            L"Failed to create a system restore point (System Restore may be disabled).\n"
+            L"Continue cleanup anyway?",
+            L"Warning", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+        if (retry != IDYES) {
+            UpdateActionButtons();
+            UpdateStatusText(L"Cleanup cancelled");
+            return;
+        }
+    }
+
+    UpdateStatusText(L"Cleaning...");
 
     // Set callbacks that post messages to UI thread
     cleaner_->SetProgressCallback([this](CleanupCategory, const std::wstring&, int64_t bytesFreed) {
@@ -525,19 +681,30 @@ void MainWindow::OnCleanClick() {
     });
 
     cleaner_->StartCleanup(results);
+    UpdateActionButtons();
 }
 
 void MainWindow::OnSelectAllClick() {
-    allSelected_ = !allSelected_;
-    SendMessageW(hSelectAllCheck_, BM_SETCHECK,
-        allSelected_ ? BST_CHECKED : BST_UNCHECKED, 0);
+    // BS_AUTOCHECKBOX 已切换控件状态，以控件实际状态为准（可能被用户单独取消过某些项）
+    const bool checked = SendMessageW(hSelectAllCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
 
-    auto results = scanner_->GetResults();
-    for (size_t i = 0; i < results.size(); i++) {
-        ListView_SetCheckState(hListView_, i, allSelected_);
-        scanner_->SetItemEnabled(results[i].category, allSelected_);
+    updatingList_ = true;
+    for (int i = 0; i < static_cast<int>(CleanupCategory::Count); i++) {
+        ListView_SetCheckState(hListView_, i, checked);
+        scanner_->SetItemEnabled(static_cast<CleanupCategory>(i), checked);
     }
+    updatingList_ = false;
     UpdateSizeText(scanner_->GetTotalSize());
+}
+
+void MainWindow::OnRestoreClick() {
+    // 打开系统还原界面，用户可选择清理前创建的还原点回滚
+    if (!OpenSystemRestore()) {
+        MessageBoxW(hWnd_,
+            L"Failed to open System Restore.\n"
+            L"Please search for 'Create a restore point' in the Start menu.",
+            L"Error", MB_OK | MB_ICONERROR);
+    }
 }
 
 void MainWindow::SetListViewItem(int index, const CleanupItem& item) {

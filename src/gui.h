@@ -20,6 +20,7 @@ constexpr int IDC_STATUS_TEXT   = 1006;
 constexpr int IDC_SIZE_TEXT     = 1007;
 constexpr int IDC_ELEVATE_COMBO = 1008;
 constexpr int IDC_ELEVATE_LABEL = 1009;
+constexpr int IDC_RESTORE_BUTTON = 1010;
 
 // Custom messages for thread-safe UI updates
 constexpr UINT WM_SCAN_PROGRESS = WM_USER + 10;
@@ -55,13 +56,16 @@ private:
 
     void UpdateLayout(int width, int height);
     void UpdateListView();
-    void UpdateButtons(bool scanning);
+    void UpdateActionButtons();
     void UpdateStatusText(const std::wstring& text);
     void UpdateSizeText(int64_t totalSize);
+
+    int Scale(int value) const { return MulDiv(value, dpi_, 96); }
 
     void OnScanClick();
     void OnCleanClick();
     void OnSelectAllClick();
+    void OnRestoreClick();
 
     void SetListViewItem(int index, const CleanupItem& item);
 
@@ -77,6 +81,7 @@ private:
     HWND hSizeText_ = nullptr;
     HWND hElevateCombo_ = nullptr;
     HWND hElevateLabel_ = nullptr;
+    HWND hRestoreButton_ = nullptr;
 
     HINSTANCE hInstance_ = nullptr;
     int dpi_ = 96;
@@ -87,7 +92,9 @@ private:
     std::unique_ptr<Scanner> scanner_;
     std::unique_ptr<Cleaner> cleaner_;
 
-    bool allSelected_ = true;
+    bool updatingList_ = false;
+    int64_t restorePointId_ = 0;
+    int64_t cleanTotalSize_ = 0;
 };
 
 } // namespace diskcleaner

@@ -17,8 +17,8 @@ if(MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++latest")
 endif()
 
-# Release optimizations (保留 CMake 默认的 /MD /O2 /DNDEBUG，追加 LTCG 与体积优化)
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /GL /GF /Gy")
+# Release optimizations (定制工具链的 Release 标志可能为空，显式补齐优化)
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /Ob2 /DNDEBUG /GL /GF /Gy")
 set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG /OPT:REF /OPT:ICF")
 
 # Source files
@@ -28,6 +28,10 @@ set(SOURCES
     src/cleaner.cpp
     src/category_paths.cpp
     src/gui.cpp
+    src/details.cpp
+    src/chromium_cache.cpp
+    src/safety.cpp
+    src/smart.cpp
     src/utils.cpp
     src/elevator.cpp
 )

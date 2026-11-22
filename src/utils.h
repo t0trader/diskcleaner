@@ -34,6 +34,8 @@ int64_t GetDirectorySize(const std::wstring& path, int64_t* fileCount = nullptr,
                          const std::atomic<bool>* cancel = nullptr);
 bool DeleteDirectoryContents(const std::wstring& path);
 bool DeleteDirectoryRecursive(const std::wstring& path);
+// 删除整棵目录树；失败时清除只读属性后重试一次。返回目录是否已不存在。
+bool RemoveTreeForce(const std::wstring& path);
 bool DeleteFileSafe(const std::wstring& path);
 bool EmptyRecycleBin(HWND hwnd = nullptr);
 bool IsRunAsAdmin();

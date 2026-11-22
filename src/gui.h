@@ -23,6 +23,9 @@ constexpr int IDC_SIZE_TEXT     = 1007;
 constexpr int IDC_ELEVATE_COMBO = 1008;
 constexpr int IDC_ELEVATE_LABEL = 1009;
 constexpr int IDC_RESTORE_BUTTON = 1010;
+constexpr int IDC_SMART_CHECK   = 1011;
+constexpr int IDC_AGE_COMBO     = 1012;
+constexpr int IDC_DETAILS_BUTTON = 1013;
 
 // Custom messages for thread-safe UI updates
 constexpr UINT WM_SCAN_PROGRESS = WM_USER + 10;
@@ -56,6 +59,7 @@ private:
     void CreateProgressBar();
     void CreateStatusBar();
     void CreateElevationCombo();
+    void CreateSmartControls();
 
     void UpdateLayout(int width, int height);
     void UpdateListView();
@@ -69,6 +73,10 @@ private:
     void OnCleanClick();
     void OnSelectAllClick();
     void OnRestoreClick();
+    void OnDetailsClick();
+    void ApplySmartOptions();
+    void LoadSmartSettings();
+    void SaveSmartSettings();
 
     void SetListViewItem(int index, const CleanupItem& item);
 
@@ -85,6 +93,9 @@ private:
     HWND hElevateCombo_ = nullptr;
     HWND hElevateLabel_ = nullptr;
     HWND hRestoreButton_ = nullptr;
+    HWND hSmartCheck_ = nullptr;
+    HWND hAgeCombo_ = nullptr;
+    HWND hDetailsButton_ = nullptr;
 
     HINSTANCE hInstance_ = nullptr;
     int dpi_ = 96;
@@ -96,6 +107,7 @@ private:
     std::unique_ptr<Cleaner> cleaner_;
 
     bool updatingList_ = false;
+    bool detailsOpen_ = false;
     int64_t restorePointId_ = 0;
     int64_t cleanTotalSize_ = 0;
 };

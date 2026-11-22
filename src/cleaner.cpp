@@ -1,50 +1,18 @@
 #include "cleaner.h"
 #include "category_paths.h"
+#include "safety.h"
+#include "smart.h"
 #include "utils.h"
 #include <filesystem>
 #include <chrono>
+#include <vector>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
 namespace diskcleaner {
 
 namespace {
-
-// 清除目录树中文件的只读属性（不跟踪符号链接），用于删除失败后的重试。
-// 只读属性会阻止 DeleteFile，只清除不会改变目录结构。
-void ClearReadOnlyRecursive(const std::wstring& root) {
-    std::error_code ec;
-    fs::recursive_directory_iterator it(root,
-        fs::directory_options::skip_permission_denied, ec);
-    const fs::recursive_directory_iterator end;
-    while (!ec && it != end) {
-        std::error_code entryEc;
-        if (it->is_symlink(entryEc)) {
-            it.disable_recursion_pending();
-        } else {
-            DWORD attrs = GetFileAttributesW(it->path().c_str());
-            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
-                SetFileAttributesW(it->path().c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
-            }
-        }
-        it.increment(ec);
-    }
-}
-
-// 删除目录树；失败时清除只读属性后重试一次。
-bool RemoveTree(const std::wstring& path) {
-    std::error_code ec;
-    fs::remove_all(path, ec);
-    if (!ec) return true;
-
-    ClearReadOnlyRecursive(path);
-    ec.clear();
-    fs::remove_all(path, ec);
-    if (ec) return false;
-
-    std::error_code existsEc;
-    return !fs::exists(path, existsEc);
-}
 
 // 删除单个文件；只读文件清除属性后重试，失败则恢复原属性。
 bool DeleteFileWithRetry(const std::wstring& path) {
@@ -84,12 +52,32 @@ bool IsCommandCategory(CleanupCategory category) {
     }
 }
 
+int EffectiveThresholdHours(const CleanupOptions& options, CleanupCategory category) {
+    // Prefetch 无论 Smart mode 是否开启都至少保留 24 小时，与扫描规则保持一致
+    if (category == CleanupCategory::Prefetch) {
+        if (!options.smartMode) return 24;
+        return options.ageThresholdHours > 24 ? options.ageThresholdHours : 24;
+    }
+    if (!options.smartMode) return 0;
+    return options.ageThresholdHours;
+}
+
 } // namespace
 
 Cleaner::Cleaner() {}
 
 Cleaner::~Cleaner() {
     StopCleanup();
+}
+
+void Cleaner::SetOptions(const CleanupOptions& options) {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
+    options_ = options;
+}
+
+CleanupOptions Cleaner::GetOptions() const {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
+    return options_;
 }
 
 void Cleaner::StartCleanup(const std::vector<CleanupItem>& items) {
@@ -108,12 +96,25 @@ void Cleaner::StartCleanup(const std::vector<CleanupItem>& items) {
     bytesFreed_ = 0;
     filesDeleted_ = 0;
     filesFailed_ = 0;
+    skippedNewer_ = 0;
+    skippedProtected_ = 0;
+    skippedRunningApps_ = 0;
+
+    const CleanupOptions options = GetOptions();
 
     std::vector<CleanupItem> enabledItems;
     for (const auto& item : items) {
         if (!item.enabled || !item.scanned) continue;
         // 跳过扫描结果为空的文件类类别，避免无意义地停止/重启系统服务
         if (item.size == 0 && !IsCommandCategory(item.category)) continue;
+        // 应用仍在运行：整类跳过，避免删除其正在使用的缓存（与时间闸门相互独立）
+        if (options.skipRunningApps) {
+            auto procs = GetCategoryProcessNames(item.category);
+            if (!procs.empty() && !FindRunningProcess(procs).empty()) {
+                ++skippedRunningApps_;
+                continue;
+            }
+        }
         enabledItems.push_back(item);
     }
 
@@ -187,7 +188,7 @@ bool Cleaner::CleanupCategoryItem(const CleanupItem& item, const CleanupProgress
             bool success = true;
             for (const auto& p : GetCategoryPaths(item.category)) {
                 if (DirectoryExists(p)) {
-                    success &= CleanupDirectory(p, item.category, progressCb);
+                    success &= CleanupTree(p, item.category, progressCb);
                 } else if (FileExists(p)) {
                     success &= CleanupFile(p, item.category);
                 }
@@ -201,7 +202,7 @@ bool Cleaner::CleanupCategoryItem(const CleanupItem& item, const CleanupProgress
             bool success = true;
             for (const auto& p : GetCategoryPaths(item.category)) {
                 if (DirectoryExists(p)) {
-                    success &= CleanupDirectory(p, item.category, progressCb);
+                    success &= CleanupTree(p, item.category, progressCb);
                 }
             }
             StartServiceByName(L"FontCache");
@@ -215,13 +216,13 @@ bool Cleaner::CleanupCategoryItem(const CleanupItem& item, const CleanupProgress
             bool success = true;
             for (const auto& p : GetCategoryPaths(item.category)) {
                 if (DirectoryExists(p)) {
-                    success &= CleanupDirectory(p, item.category, progressCb);
+                    success &= CleanupTree(p, item.category, progressCb);
                 }
             }
             // 同时清理 SoftwareDistribution 根目录下的残留数据
             std::wstring root = GetWindowsDir() + L"\\SoftwareDistribution";
             if (DirectoryExists(root)) {
-                success &= CleanupDirectory(root, item.category, progressCb);
+                success &= CleanupTree(root, item.category, progressCb);
             }
             StartServiceByName(L"wuauserv");
             StartServiceByName(L"bits");
@@ -233,7 +234,7 @@ bool Cleaner::CleanupCategoryItem(const CleanupItem& item, const CleanupProgress
             StopServiceAndWait(L"Spooler");
             std::wstring spool = GetSystemDir() + L"\\spool\\PRINTERS";
             bool success = DirectoryExists(spool)
-                ? CleanupDirectory(spool, item.category, progressCb)
+                ? CleanupTree(spool, item.category, progressCb)
                 : true;
             StartServiceByName(L"Spooler");
             return success;
@@ -249,7 +250,7 @@ bool Cleaner::CleanupCategoryItem(const CleanupItem& item, const CleanupProgress
             // 逐项清理并统计，避免再叠加扫描大小导致重复计数
             for (const auto& dp : dumpPaths) {
                 if (DirectoryExists(dp)) {
-                    CleanupDirectory(dp, item.category, progressCb);
+                    CleanupTree(dp, item.category, progressCb);
                 } else {
                     CleanupFile(dp, item.category);
                 }
@@ -283,7 +284,7 @@ bool Cleaner::CleanupCategoryItem(const CleanupItem& item, const CleanupProgress
     for (const auto& path : GetCategoryPaths(item.category)) {
         if (stopRequested_) break;
         if (DirectoryExists(path)) {
-            CleanupDirectory(path, item.category, progressCb);
+            CleanupTree(path, item.category, progressCb);
         } else if (FileExists(path)) {
             CleanupFile(path, item.category);
         }
@@ -291,76 +292,120 @@ bool Cleaner::CleanupCategoryItem(const CleanupItem& item, const CleanupProgress
     return true;
 }
 
-bool Cleaner::CleanupDirectory(const std::wstring& path, CleanupCategory category, const CleanupProgressCallback& progressCb) {
-    // 进度节流：每个目录最多每 100ms 回调一次，避免大量小文件时刷爆消息队列
-    ULONGLONG lastReport = 0;
-    try {
-        for (const auto& entry : fs::directory_iterator(path,
-                fs::directory_options::skip_permission_denied)) {
-            if (stopRequested_) return false;
-            try {
-                // 跳过符号链接/目录联接，避免循环遍历和误删目标文件
-                if (entry.is_symlink()) continue;
+bool Cleaner::CleanupTree(const std::wstring& root, CleanupCategory category,
+                          const CleanupProgressCallback& progressCb, int depth) {
+    if (depth > 64 || stopRequested_) return false;
 
-                std::wstring entryPath = entry.path().wstring();
-                ULONGLONG now = GetTickCount64();
-                if (progressCb && now - lastReport >= 100) {
-                    lastReport = now;
-                    progressCb(category, entryPath, bytesFreed_.load());
-                }
-
-                if (category == CleanupCategory::Prefetch) {
-                    auto lastWrite = entry.last_write_time();
-                    auto age = fs::file_time_type::clock::now() - lastWrite;
-                    if (age < std::chrono::hours(24)) continue;
-                }
-
-                if (category == CleanupCategory::ThumbnailCache) {
-                    std::wstring filename = entry.path().filename().wstring();
-                    if (filename.find(L"thumbcache") == std::wstring::npos &&
-                        filename.find(L"iconcache") == std::wstring::npos) {
-                        continue;
-                    }
-                }
-
-                if (entry.is_directory()) {
-                    int64_t entryCount = 0;
-                    int64_t entrySize = GetDirectorySize(entryPath, &entryCount, &stopRequested_);
-                    if (stopRequested_) return false;
-                    if (RemoveTree(entryPath)) {
-                        bytesFreed_ += entrySize;
-                        filesDeleted_ += entryCount;
-                    } else {
-                        filesFailed_ += (entryCount > 0 ? entryCount : 1);
-                    }
-                } else {
-                    int64_t entrySize = FileSizeSafe(entryPath);
-                    if (DeleteFileWithRetry(entryPath)) {
-                        bytesFreed_ += entrySize;
-                        filesDeleted_ += 1;
-                    } else {
-                        filesFailed_ += 1;
-                    }
-                }
-            } catch (...) {
-                filesFailed_ += 1;
-            }
-        }
-    } catch (...) {
+    // 根路径安全校验：拒绝盘符根、用户目录根、Windows 目录、目录联接等
+    if (!IsSafeDeleteRoot(root)) {
+        ++filesFailed_;
         return false;
+    }
+
+    const CleanupOptions options = GetOptions();
+    const int thresholdHours = IsServiceManagedCategory(category)
+        ? 0
+        : EffectiveThresholdHours(options, category);
+    const bool filterThumbnails = (category == CleanupCategory::ThumbnailCache);
+
+    // 先快照子项再处理：删除子项会使目录迭代器失效
+    std::vector<fs::directory_entry> children;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(fs::path(root),
+            fs::directory_options::skip_permission_denied, ec)) {
+        children.push_back(entry);
+    }
+
+    ULONGLONG lastReport = 0;
+    for (const auto& entry : children) {
+        if (stopRequested_) return false;
+
+        std::error_code entryEc;
+        try {
+            if (entry.is_symlink(entryEc)) continue;
+
+            const std::wstring entryPath = entry.path().wstring();
+            const std::wstring leaf = entry.path().filename().wstring();
+
+            ULONGLONG now = GetTickCount64();
+            if (progressCb && now - lastReport >= 100) {
+                lastReport = now;
+                progressCb(category, entryPath, bytesFreed_.load());
+            }
+
+            // 用户数据护栏：Login Data / Cookies / IndexedDB / Local Storage 等永不删除
+            if (IsProtectedDataName(leaf)) {
+                ++skippedProtected_;
+                continue;
+            }
+
+            // CacheStorage 的 index.txt 是站点注册索引，保留它可让浏览器继续复用该站点缓存
+            if (category == CleanupCategory::BrowserSWCache &&
+                _wcsicmp(leaf.c_str(), L"index.txt") == 0) {
+                continue;
+            }
+
+            if (entry.is_directory(entryEc)) {
+                CleanupTree(entryPath, category, progressCb, depth + 1);
+                // 只移除已被清空的子目录，保留仍含新文件/受保护文件的目录
+                RemoveDirectoryW(entryPath.c_str());
+                continue;
+            }
+
+            if (filterThumbnails &&
+                leaf.find(L"thumbcache") == std::wstring::npos &&
+                leaf.find(L"iconcache") == std::wstring::npos) {
+                continue;
+            }
+
+            if (!IsFileOlderThan(entryPath, thresholdHours)) {
+                ++skippedNewer_;
+                continue;
+            }
+
+            int64_t entrySize = FileSizeSafe(entryPath);
+            if (DeleteFileWithRetry(entryPath)) {
+                bytesFreed_ += entrySize;
+                ++filesDeleted_;
+            } else {
+                ++filesFailed_;
+            }
+        } catch (...) {
+            ++filesFailed_;
+        }
     }
     return true;
 }
 
 bool Cleaner::CleanupFile(const std::wstring& path, CleanupCategory category) {
     if (!FileExists(path)) return false;
+    if (!IsSafeDeleteRoot(path)) {
+        ++filesFailed_;
+        return false;
+    }
+
+    const std::wstring leaf = fs::path(path).filename().wstring();
+    if (IsProtectedDataName(leaf)) {
+        ++skippedProtected_;
+        return false;
+    }
+
+    const CleanupOptions options = GetOptions();
+    const int thresholdHours = IsServiceManagedCategory(category)
+        ? 0
+        : EffectiveThresholdHours(options, category);
+    if (!IsFileOlderThan(path, thresholdHours)) {
+        ++skippedNewer_;
+        return false;
+    }
+
     int64_t size = FileSizeSafe(path);
     if (DeleteFileWithRetry(path)) {
         bytesFreed_ += size;
-        filesDeleted_ += 1;
+        ++filesDeleted_;
         return true;
     }
-    filesFailed_ += 1;
+    ++filesFailed_;
     return false;
 }
 

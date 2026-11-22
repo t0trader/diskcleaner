@@ -1,5 +1,32 @@
 # 变更记录
 
+## [未发布] - 2026-11-20
+
+### 新增：智能清理（Smart mode）
+
+- 时间闸门：只删除超过阈值（默认 24 小时，可选 3/7/30 天或关闭）未修改的文件。扫描与清理共用同一策略，界面显示的可清理大小即实际可删除量，避免误删正在写入的临时文件与活跃缓存。
+- 应用占用感知：新增类别→进程名映射（msedge/chrome/firefox/Code/Cursor/Trae/Qoder CN/JetBrains/Weixin…）。扫描时列表标记 `[in use]`，清理时整类跳过并在确认框与完成提示中说明。
+- 新增 `Browser Service Worker Cache` 类别：覆盖 Edge、Edge SxS、Chrome（含 Beta/Dev/SxS）、Brave、Vivaldi、Chromium 的 `Service Worker\CacheStorage` 与 `ScriptCache`。这是浏览器占用磁盘的大头（实测单机可达 3.6 GB），此前完全未覆盖。
+- 新增 `WeChat Media Cache` 类别：微信 4.x 的 `xwechat\log` 与 `radium\web`，保留 `radium\users`（聊天数据）与 `xplugin`（插件）。
+- 站点级归因：解析 CacheStorage 哈希目录的 `index.txt` 得到站点域名；无域名时从缓存条目开头抽样 URL 取众数。详情窗口按站点展示大小与最近使用时间，支持按站点删除。
+- 详情窗口：任意类别可查看 Top 10 大子目录/文件（只读）。
+- 安全护栏：`Login Data` / `Cookies` / `Bookmarks` / `Preferences` / `Local Storage` / `IndexedDB` / `*.ost` / `settings.json` 等受保护名永不删除；盘符根、用户目录根、Windows 系统目录、目录联接拒绝作为删除目标；只删目录内容，不删类别根目录；CacheStorage 的 `index.txt` 保留以维持站点注册。
+- GUI：新增 Smart mode 开关、时间阈值下拉与 Details 按钮；设置持久化到 `HKCU\Software\JCleaner`。
+
+### 修复 / 调整
+
+- `TraeCache` 修正为同时匹配 `Trae CN`（国内版真实目录名）。
+- `QoderCache` 修正为 `.qoder-cn`（logs/tmp/.cache）与 `%APPDATA%\com.qodercn.app.stable`，保留 bin/plugins/projects/memories。
+- `EdgeCache` 补齐 Edge SxS 与 `Crashpad`、`component_crx_cache`、`ProvenanceData`。
+- 清理引擎改为逐文件过滤删除：不再整目录 `remove_all`，未到阈值的文件与被占用文件会保留，空子目录自动移除。
+- 完成提示新增 “kept N recent files / protected N files / N categories skipped (app running)”。
+- 修复详情窗口关闭导致整个程序退出的问题：原实现用 `PostQuitMessage` 结束模态循环，会把主窗口的消息循环一并终止；改为 `PostThreadMessage(WM_APP+2)` 私有通知，且不再依赖 `IsWindow` 判断退出。
+- 详情窗口加载改为窗口显示后再统计（`WM_APP+1`），避免打开瞬间卡顿；新增重入保护，连点 Details 不会叠加多个窗口。
+- 修复扫描与清理阈值不一致：服务托管类别（搜索索引/字体缓存/Windows Update/打印队列）在扫描侧此前仍按 24h 过滤，导致显示 0 且无法清理；现在两侧统一不做时间过滤。
+- 修复关闭 Smart mode 时 Prefetch 的行为不一致：扫描仍保留 24h 规则、清理却全删；现统一为始终至少保留 24h。
+- `Cleaner` 删除单个文件前同样执行危险根路径校验；`CacheStorage` 统计增加文件大小/时间的错误码保护，避免异常值污染显示。
+- Smart mode 阈值下拉对无法识别的注册表值回落到 24 小时。
+
 ## [未发布] - 2026-11-11
 
 本次为代码审查后的修复与增强，覆盖扫描、清理、权限提升、GUI、构建配置与文档。

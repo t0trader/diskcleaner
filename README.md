@@ -89,6 +89,17 @@
 | 通义灵码缓存 | 通义灵码缓存文件 | 低 |
 | CodeGeeX 缓存 | CodeGeeX 扩展缓存 | 低 |
 | Warp 终端缓存 | Warp 终端缓存/临时/日志（保留 settings） | 低 |
+| **浏览器 Service Worker 缓存** | Edge / Edge SxS / Chrome / Brave / Vivaldi / Chromium 的 `CacheStorage` + `ScriptCache`（不含 Cookie/登录态/IndexedDB） | 中 |
+| **微信 4.x 媒体缓存** | `xwechat\log` 日志与 `radium\web` 内置浏览器缓存（保留聊天数据与插件） | 低 |
+
+### 智能清理策略（Smart mode）
+
+- **时间闸门**：默认只清理 24 小时未修改的文件，可选 3 天 / 7 天 / 30 天 / 不限制。扫描与清理共用同一策略，列表里显示的大小就是实际可删除量；正在写入的临时文件和活跃缓存不会被碰。
+- **应用占用感知**：每个类别登记关联进程（msedge/chrome/Code/Cursor/Trae/Qoder CN/Weixin…）。扫描时在列表标记 `[in use]`，清理时默认整类跳过，并在确认框里列出会被跳过的类别。
+- **站点级归因**：详情窗口解析 Chromium `CacheStorage` 每个哈希目录的 `index.txt`（无域名时从缓存条目抽样反查），按站点列出占用大小与最近使用时间，可按站点单独删除，例如只清掉视频站的缓存而保留办公站点。
+- **Top 榜单**：任意类别双击/选中后点 Details，可查看该类别下最大的 10 个子目录/文件。
+- **安全护栏**：`Login Data`、`Cookies`、`Bookmarks`、`Preferences`、`Local Storage`、`IndexedDB`、`*.ost`、`settings.json` 等用户数据永不删除；盘符根、用户目录根、Windows 系统目录拒绝作为删除目标；目录联接/符号链接一律跳过；只删除目录内容，不删除类别根目录。
+- 设置持久化在 `HKCU\Software\JCleaner`。
 
 ### 主要功能
 
@@ -122,7 +133,9 @@ cmake -B build -G "Visual Studio 18 2026" -A x64
 cmake --build build --config Release
 ```
 
-构建完成后，可执行文件位于 `build/bin/Release/DiskCleaner.exe`。
+或直接运行 `tools\build.ps1`（自动加载 VS2026 开发环境，用 Ninja 构建）。
+
+构建完成后，Visual Studio 生成器的可执行文件位于 `build/bin/Release/DiskCleaner.exe`，Ninja 生成器位于 `build/bin/DiskCleaner.exe`。
 
 ## 使用方法
 
@@ -156,6 +169,8 @@ cmake --build build --config Release
 - AI IDE 缓存清理仅针对缓存/临时目录，保留用户配置；Claude Code 会话记录、Codex 历史等可选清理，请确认后勾选
 - “Crash Dump Settings” 会写入注册表关闭崩溃转储与 WER，默认不勾选
 - 被其他进程占用的文件无法删除，会在清理完成提示中计入 skipped 数量
+- 智能模式默认保留 24 小时内修改过的文件；如需彻底清理可切换到 “No age limit”
+- 目标应用（浏览器、编辑器、微信等）正在运行时，对应类别默认跳过；关闭应用后重新扫描即可
 
 ## 项目结构
 
@@ -163,9 +178,13 @@ cmake --build build --config Release
 diskcleaner/
 ├── src/
 │   ├── main.cpp          # 程序入口
-│   ├── scanner.h/cpp     # 扫描引擎
-│   ├── cleaner.h/cpp     # 清理引擎
+│   ├── scanner.h/cpp     # 扫描引擎（时间闸门 + 运行中应用标记）
+│   ├── cleaner.h/cpp     # 清理引擎（过滤删除 + 安全护栏）
 │   ├── category_paths.h/cpp # 清理类别路径表（扫描/清理共用）
+│   ├── chromium_cache.h/cpp # CacheStorage 站点归因与 Top 大项统计
+│   ├── safety.h/cpp      # 受保护数据名与危险根路径校验
+│   ├── smart.h/cpp       # 进程检测与时间阈值过滤
+│   ├── details.h/cpp     # 详情窗口（站点榜 / Top 榜单）
 │   ├── gui.h/cpp         # GUI 界面
 │   ├── elevator.h/cpp    # 权限提升
 │   ├── types.h           # 类型定义
@@ -192,6 +211,9 @@ diskcleaner/
 - Windows Event Log API (`EvtOpenChannelEnum` / `EvtClearLog`)，自动启用 SeSecurityPrivilege
 - 系统命令执行 (powercfg, ipconfig，带超时保护)
 - 注册表 API (SetRegistryValue)
+- 进程枚举 (Toolhelp32) 用于运行中应用检测
+- CacheStorage index.txt 解析与缓存条目 URL 抽样归因
+- 文件年龄过滤（扫描/清理共用阈值）
 - 删除重试：清除只读属性后重删，失败恢复属性并计入 skipped
 - 内嵌应用清单：PerMonitorV2、longPathAware、SegmentHeap、supportedOS
 

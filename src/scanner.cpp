@@ -1,5 +1,7 @@
 ﻿#include "scanner.h"
 #include "category_paths.h"
+#include "safety.h"
+#include "smart.h"
 #include "utils.h"
 #include <shellapi.h>
 #include <shlobj.h>
@@ -78,6 +80,16 @@ void Scanner::SetItemEnabled(CleanupCategory category, bool enabled) {
     }
 }
 
+void Scanner::SetOptions(const CleanupOptions& options) {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
+    options_ = options;
+}
+
+CleanupOptions Scanner::GetOptions() const {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
+    return options_;
+}
+
 void Scanner::ScanWorker() {
     // Copy callbacks under lock to avoid race with SetCallback
     ScanProgressCallback progressCb;
@@ -121,26 +133,12 @@ void Scanner::ScanWorker() {
     }
 }
 
-// Prefetch 目录中最近 24 小时内使用的文件不会被清理，
-// 扫描时同样跳过，避免显示的可清理大小高于实际可释放量。
+// Prefetch 目录中最近使用的文件不会被清理；扫描时同样跳过，
+// 避免显示的可清理大小高于实际可释放量。Prefetch 至少保留 24 小时。
 static int64_t GetPrefetchSize(const std::wstring& path, int64_t& fileCount,
-                               const std::atomic<bool>& cancel) {
-    int64_t total = 0;
-    fileCount = 0;
-    try {
-        for (const auto& entry : fs::recursive_directory_iterator(path,
-                fs::directory_options::skip_permission_denied)) {
-            if (cancel.load()) break;
-            try {
-                if (entry.is_symlink() || !entry.is_regular_file()) continue;
-                auto age = fs::file_time_type::clock::now() - entry.last_write_time();
-                if (age < std::chrono::hours(24)) continue;
-                total += entry.file_size();
-                ++fileCount;
-            } catch (...) {}
-        }
-    } catch (...) {}
-    return total;
+                               const std::atomic<bool>& cancel, int thresholdHours) {
+    const int hours = thresholdHours > 24 ? thresholdHours : 24;
+    return GetDirectorySizeFiltered(path, hours, &fileCount, &cancel);
 }
 
 CleanupItem Scanner::ScanCategory(CleanupCategory category) {
@@ -153,6 +151,22 @@ CleanupItem Scanner::ScanCategory(CleanupCategory category) {
     item.enabled = (item.risk != RiskLevel::High) &&
                    category != CleanupCategory::CrashDumpSettings;
     item.scanned = true;
+
+    const CleanupOptions options = GetOptions();
+    // 服务托管类别停服后整体清理，扫描也必须不做时间过滤，否则会显示 0 而无法清理
+    const int thresholdHours = IsServiceManagedCategory(category)
+        ? 0
+        : (options.smartMode ? options.ageThresholdHours : 0);
+
+    // 关联应用正在运行时给出提示（清理阶段可整体跳过）
+    auto procs = GetCategoryProcessNames(category);
+    if (!procs.empty()) {
+        std::wstring running = FindRunningProcess(procs);
+        if (!running.empty()) {
+            item.appRunning = true;
+            item.runningProcess = running;
+        }
+    }
 
     // Special categories that don't have directory sizes (commands/system-level)
     std::wstring winDir = GetWindowsDir();
@@ -183,10 +197,11 @@ CleanupItem Scanner::ScanCategory(CleanupCategory category) {
         for (const auto& dp : dumpPaths) {
             if (DirectoryExists(dp)) {
                 int64_t fc = 0;
-                int64_t sz = GetDirectorySize(dp, &fc);
+                int64_t sz = GetDirectorySizeFiltered(dp, thresholdHours, &fc, &stopRequested_);
                 item.size += sz;
                 item.fileCount += fc;
             } else if (FileExists(dp)) {
+                if (!IsFileOlderThan(dp, thresholdHours)) continue;
                 try {
                     item.size += fs::file_size(dp);
                     item.fileCount += 1;
@@ -237,19 +252,22 @@ CleanupItem Scanner::ScanCategory(CleanupCategory category) {
         if (category == CleanupCategory::Prefetch) {
             item.path = path;
             int64_t fileCount = 0;
-            item.size += GetPrefetchSize(path, fileCount, stopRequested_);
+            item.size += GetPrefetchSize(path, fileCount, stopRequested_, thresholdHours);
             item.fileCount += fileCount;
         } else if (DirectoryExists(path)) {
             item.path = path;
             int64_t fileCount = 0;
-            int64_t size = GetDirectorySize(path, &fileCount, &stopRequested_);
+            int64_t size = GetDirectorySizeFiltered(path, thresholdHours, &fileCount, &stopRequested_);
             item.size += size;
             item.fileCount += fileCount;
         } else if (FileExists(path)) {
+            if (IsProtectedDataName(fs::path(path).filename().wstring())) continue;
+            if (!IsFileOlderThan(path, thresholdHours)) continue;
             try {
                 int64_t sz = fs::file_size(path);
                 item.size += sz;
                 item.fileCount += 1;
+                item.path = path;
             } catch (...) {}
         }
     }
@@ -356,6 +374,8 @@ std::wstring Scanner::GetCategoryName(CleanupCategory category) {
         case CleanupCategory::LingmaCache:          return L"Lingma Cache";
         case CleanupCategory::CodeGeeXCache:        return L"CodeGeeX Cache";
         case CleanupCategory::WarpCache:            return L"Warp Terminal Cache";
+        case CleanupCategory::BrowserSWCache:       return L"Browser Service Worker Cache";
+        case CleanupCategory::WeChatMediaCache:     return L"WeChat Media Cache";
         default:                                    return L"Unknown";
     }
 }
@@ -554,6 +574,10 @@ std::wstring Scanner::GetCategoryDescription(CleanupCategory category) {
             return L"CodeGeeX extension cache files";
         case CleanupCategory::WarpCache:
             return L"Warp terminal cache, temp and logs (settings preserved)";
+        case CleanupCategory::BrowserSWCache:
+            return L"Chromium per-site offline cache (CacheStorage), rebuilt on next visit";
+        case CleanupCategory::WeChatMediaCache:
+            return L"WeChat 4.x logs and embedded browser cache (chat data preserved)";
         default:
             return L"";
     }
@@ -683,6 +707,12 @@ RiskLevel Scanner::GetCategoryRisk(CleanupCategory category) {
         case CleanupCategory::LingmaCache:
         case CleanupCategory::CodeGeeXCache:
         case CleanupCategory::WarpCache:
+            return RiskLevel::Low;
+
+        // 站点离线缓存/微信媒体缓存可重建，但会丢失 PWA 离线数据
+        case CleanupCategory::BrowserSWCache:
+            return RiskLevel::Medium;
+        case CleanupCategory::WeChatMediaCache:
             return RiskLevel::Low;
 
         default:

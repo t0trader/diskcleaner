@@ -1,4 +1,5 @@
 ﻿#include "gui.h"
+#include "details.h"
 #include "utils.h"
 #include <commctrl.h>
 #include <shellapi.h>
@@ -34,6 +35,36 @@ static bool IsCommandCleanup(CleanupCategory category) {
         default:
             return false;
     }
+}
+
+// 智能模式设置持久化（HKCU\Software\JCleaner）
+static const wchar_t kSettingsKey[] = L"Software\\JCleaner";
+static const int kAgeHours[] = {24, 72, 168, 720, 0};
+
+static DWORD LoadSettingDword(const wchar_t* name, DWORD fallback) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+        return fallback;
+    }
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    DWORD type = 0;
+    LONG rc = RegQueryValueExW(key, name, nullptr, &type,
+        reinterpret_cast<LPBYTE>(&value), &size);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD) return fallback;
+    return value;
+}
+
+static void SaveSettingDword(const wchar_t* name, DWORD value) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kSettingsKey, 0, nullptr, 0,
+            KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    RegSetValueExW(key, name, 0, REG_DWORD,
+        reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
 }
 
 MainWindow::MainWindow() {
@@ -76,8 +107,9 @@ bool MainWindow::Create(HINSTANCE hInstance, int nCmdShow,
 
     int x = CW_USEDEFAULT;
     int y = CW_USEDEFAULT;
-    int width = MulDiv(800, static_cast<int>(sysDpi), 96);
-    int height = MulDiv(600, static_cast<int>(sysDpi), 96);
+    // 顶部新增 Smart mode 工具条，初始尺寸相应加宽，且不低于最小跟踪尺寸
+    int width = MulDiv(900, static_cast<int>(sysDpi), 96);
+    int height = MulDiv(640, static_cast<int>(sysDpi), 96);
 
     // 提权后的新实例沿用原窗口的位置与大小
     const bool hasPlacement = initialRect &&
@@ -174,6 +206,13 @@ LRESULT MainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
         case WM_DPICHANGED:
             OnDpiChanged(HIWORD(wParam), reinterpret_cast<RECT*>(lParam));
             return 0;
+        case WM_GETMINMAXINFO: {
+            // 保证顶部工具条（Smart mode / 阈值 / Details）与右侧提权选择框不重叠
+            auto mmi = reinterpret_cast<MINMAXINFO*>(lParam);
+            mmi->ptMinTrackSize.x = Scale(860);
+            mmi->ptMinTrackSize.y = Scale(560);
+            return 0;
+        }
 
         // Thread-safe UI updates from scanner/cleaner threads
         case WM_SCAN_PROGRESS: {
@@ -194,7 +233,15 @@ LRESULT MainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
             SendMessageW(hProgressBar_, PBM_SETPOS, 100, 0);
             int64_t totalSize = scanner_->GetTotalSize();
             std::wstring status = L"Scan complete - " + FormatBytes(totalSize) + L" recoverable";
+            int busy = 0;
+            for (const auto& item : scanner_->GetResults()) {
+                if (item.appRunning && item.enabled) ++busy;
+            }
+            if (busy > 0) {
+                status += L" (" + std::to_wstring(busy) + L" categories in use, will be skipped)";
+            }
             UpdateStatusText(status);
+            UpdateActionButtons();
             return 0;
         }
         case WM_CLEAN_PROGRESS: {
@@ -220,6 +267,18 @@ LRESULT MainWindow::HandleMessage(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPa
             if (filesFailed > 0) {
                 status += L", skipped " + std::to_wstring(filesFailed) + L" (in use)";
             }
+            const int64_t keptNewer = cleaner_->GetSkippedNewerFiles();
+            if (keptNewer > 0) {
+                status += L", kept " + std::to_wstring(keptNewer) + L" recent files";
+            }
+            const int64_t protectedFiles = cleaner_->GetSkippedProtectedFiles();
+            if (protectedFiles > 0) {
+                status += L", protected " + std::to_wstring(protectedFiles) + L" files";
+            }
+            const int skippedApps = cleaner_->GetSkippedRunningApps();
+            if (skippedApps > 0) {
+                status += L", " + std::to_wstring(skippedApps) + L" categories skipped (app running)";
+            }
             if (restorePointId_ != 0) {
                 status += L" (restore point created)";
             }
@@ -239,6 +298,7 @@ bool MainWindow::OnCreate(HWND hWnd) {
     dpi_ = dpi != 0 ? static_cast<int>(dpi) : 96;
     CreateFonts();
     CreateControls();
+    LoadSmartSettings();
     return true;
 }
 
@@ -258,6 +318,13 @@ void MainWindow::OnCommand(int id, int notifyCode) {
         case IDC_CLEAN_BUTTON:  OnCleanClick(); break;
         case IDC_SELECT_ALL:    OnSelectAllClick(); break;
         case IDC_RESTORE_BUTTON: OnRestoreClick(); break;
+        case IDC_DETAILS_BUTTON: OnDetailsClick(); break;
+        case IDC_SMART_CHECK:
+            if (notifyCode == BN_CLICKED) ApplySmartOptions();
+            break;
+        case IDC_AGE_COMBO:
+            if (notifyCode == CBN_SELCHANGE) ApplySmartOptions();
+            break;
         case IDC_ELEVATE_COMBO:
             if (notifyCode == CBN_SELCHANGE) {
                 int sel = static_cast<int>(SendMessageW(hElevateCombo_, CB_GETCURSEL, 0, 0));
@@ -360,6 +427,9 @@ void MainWindow::OnDpiChanged(int dpi, RECT* pRect) {
         SendMessageW(hElevateLabel_, WM_SETFONT, WPARAM(hFont_), TRUE);
         SendMessageW(hElevateCombo_, WM_SETFONT, WPARAM(hFont_), TRUE);
         SendMessageW(hRestoreButton_, WM_SETFONT, WPARAM(hFontBold_), TRUE);
+        SendMessageW(hSmartCheck_, WM_SETFONT, WPARAM(hFont_), TRUE);
+        SendMessageW(hAgeCombo_, WM_SETFONT, WPARAM(hFont_), TRUE);
+        SendMessageW(hDetailsButton_, WM_SETFONT, WPARAM(hFont_), TRUE);
     }
 
     // 列宽随 DPI 重新缩放
@@ -395,6 +465,7 @@ void MainWindow::CreateControls() {
     CreateProgressBar();
     CreateStatusBar();
     CreateElevationCombo();
+    CreateSmartControls();
 
     // Apply font to all controls
     if (hFont_) {
@@ -407,6 +478,9 @@ void MainWindow::CreateControls() {
         SendMessageW(hElevateLabel_, WM_SETFONT, WPARAM(hFont_), TRUE);
         SendMessageW(hElevateCombo_, WM_SETFONT, WPARAM(hFont_), TRUE);
         SendMessageW(hRestoreButton_, WM_SETFONT, WPARAM(hFontBold_), TRUE);
+        SendMessageW(hSmartCheck_, WM_SETFONT, WPARAM(hFont_), TRUE);
+        SendMessageW(hAgeCombo_, WM_SETFONT, WPARAM(hFont_), TRUE);
+        SendMessageW(hDetailsButton_, WM_SETFONT, WPARAM(hFont_), TRUE);
     }
 
     RECT rc;
@@ -554,6 +628,125 @@ void MainWindow::CreateElevationCombo() {
     SendMessageW(hElevateCombo_, CB_SETCURSEL, selIdx, 0);
 }
 
+void MainWindow::CreateSmartControls() {
+    hSmartCheck_ = CreateWindowExW(
+        0, WC_BUTTONW, L"Smart mode",
+        WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX,
+        0, 0, 0, 0,
+        hWnd_, MakeMenuID(IDC_SMART_CHECK),
+        hInstance_, nullptr
+    );
+    SendMessageW(hSmartCheck_, BM_SETCHECK, BST_CHECKED, 0);
+
+    hAgeCombo_ = CreateWindowExW(
+        0, WC_COMBOBOXW, L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+        0, 0, 0, 0,
+        hWnd_, MakeMenuID(IDC_AGE_COMBO),
+        hInstance_, nullptr
+    );
+    SendMessageW(hAgeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"24 hours"));
+    SendMessageW(hAgeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"3 days"));
+    SendMessageW(hAgeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"7 days"));
+    SendMessageW(hAgeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"30 days"));
+    SendMessageW(hAgeCombo_, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"No age limit"));
+    SendMessageW(hAgeCombo_, CB_SETCURSEL, 0, 0);
+
+    hDetailsButton_ = CreateWindowExW(
+        0, WC_BUTTONW, L"Details",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        0, 0, 0, 0,
+        hWnd_, MakeMenuID(IDC_DETAILS_BUTTON),
+        hInstance_, nullptr
+    );
+    EnableWindow(hDetailsButton_, FALSE);
+}
+
+void MainWindow::LoadSmartSettings() {
+    CleanupOptions options;
+    options.smartMode = LoadSettingDword(L"SmartMode", 1) != 0;
+    // 该开关暂无 UI，但清理确认框与引擎行为必须一致：始终跳过运行中的应用
+    options.skipRunningApps = true;
+    options.ageThresholdHours = static_cast<int>(LoadSettingDword(L"AgeHours", 24));
+
+    int ageIdx = -1;
+    for (int i = 0; i < static_cast<int>(_countof(kAgeHours)); ++i) {
+        if (kAgeHours[i] == options.ageThresholdHours) {
+            ageIdx = i;
+            break;
+        }
+    }
+    if (ageIdx < 0) {
+        // 注册表里是自定义值时回落到默认 24 小时，避免界面显示与实际行为不符
+        ageIdx = 0;
+        options.ageThresholdHours = kAgeHours[0];
+    }
+
+    SendMessageW(hSmartCheck_, BM_SETCHECK, options.smartMode ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(hAgeCombo_, CB_SETCURSEL, ageIdx, 0);
+    EnableWindow(hAgeCombo_, options.smartMode);
+
+    scanner_->SetOptions(options);
+    cleaner_->SetOptions(options);
+}
+
+void MainWindow::SaveSmartSettings() {
+    const bool smart = SendMessageW(hSmartCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const int sel = static_cast<int>(SendMessageW(hAgeCombo_, CB_GETCURSEL, 0, 0));
+    const int hours = (sel >= 0 && sel < static_cast<int>(_countof(kAgeHours)))
+        ? kAgeHours[sel] : 24;
+
+    SaveSettingDword(L"SmartMode", smart ? 1 : 0);
+    SaveSettingDword(L"AgeHours", static_cast<DWORD>(hours));
+    SaveSettingDword(L"SkipRunningApps", 1);
+}
+
+void MainWindow::ApplySmartOptions() {
+    CleanupOptions options;
+    options.smartMode = SendMessageW(hSmartCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    options.skipRunningApps = true;
+    const int sel = static_cast<int>(SendMessageW(hAgeCombo_, CB_GETCURSEL, 0, 0));
+    options.ageThresholdHours = (sel >= 0 && sel < static_cast<int>(_countof(kAgeHours)))
+        ? kAgeHours[sel] : 24;
+
+    EnableWindow(hAgeCombo_, options.smartMode);
+    scanner_->SetOptions(options);
+    cleaner_->SetOptions(options);
+    SaveSmartSettings();
+
+    // 阈值变化会影响可清理大小，提示重新扫描
+    bool hasResults = false;
+    for (const auto& item : scanner_->GetResults()) {
+        if (item.scanned) { hasResults = true; break; }
+    }
+    if (hasResults) {
+        UpdateStatusText(L"Smart settings changed - click Scan to refresh sizes");
+    }
+}
+
+void MainWindow::OnDetailsClick() {
+    if (detailsOpen_) return;  // 双击或队列中的第二次点击不重复打开
+
+    const int sel = ListView_GetNextItem(hListView_, -1, LVNI_SELECTED);
+    if (sel < 0) {
+        MessageBoxW(hWnd_, L"Select a category first, then click Details.",
+                    L"Details", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    auto results = scanner_->GetResults();
+    if (sel >= static_cast<int>(results.size())) return;
+    const CleanupItem& item = results[static_cast<size_t>(sel)];
+    if (!item.scanned) {
+        MessageBoxW(hWnd_, L"Scan first to see what is inside this category.",
+                    L"Details", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    detailsOpen_ = true;
+    ShowCategoryDetails(hWnd_, hInstance_, item.category, item.name, dpi_);
+    detailsOpen_ = false;
+}
+
 void MainWindow::UpdateLayout(int width, int height) {
     const int padding = Scale(10);
     const int buttonHeight = Scale(40);
@@ -569,8 +762,14 @@ void MainWindow::UpdateLayout(int width, int height) {
 
     int y = padding;
 
-    // Top row: select all + elevation combo
+    // Top row: select all + smart controls + elevation combo
     MoveWindow(hSelectAllCheck_, padding, y, Scale(100), rowHeight, TRUE);
+    int x = padding + Scale(108);
+    MoveWindow(hSmartCheck_, x, y, Scale(130), rowHeight, TRUE);
+    x += Scale(132);
+    MoveWindow(hAgeCombo_, x, y, Scale(115), Scale(200), TRUE);
+    x += Scale(122);
+    MoveWindow(hDetailsButton_, x, y, Scale(88), Scale(25), TRUE);
     MoveWindow(hElevateLabel_, width - padding - Scale(250), y, labelWidth, rowHeight, TRUE);
     MoveWindow(hElevateCombo_, width - padding - comboWidth, y, comboWidth, Scale(25), TRUE);
     y += Scale(30);
@@ -623,6 +822,19 @@ void MainWindow::UpdateActionButtons() {
     EnableWindow(hScanButton_, !cleaning);
     EnableWindow(hRestoreButton_, !scanning && !cleaning);
     EnableWindow(hElevateCombo_, !scanning && !cleaning);
+    EnableWindow(hSmartCheck_, !scanning && !cleaning);
+    if (!scanning && !cleaning) {
+        const bool smart = SendMessageW(hSmartCheck_, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        EnableWindow(hAgeCombo_, smart);
+    } else {
+        EnableWindow(hAgeCombo_, FALSE);
+    }
+
+    bool hasScanned = false;
+    for (const auto& item : scanner_->GetResults()) {
+        if (item.scanned) { hasScanned = true; break; }
+    }
+    EnableWindow(hDetailsButton_, hasScanned && !scanning && !cleaning);
 
     bool hasItems = cleaning;  // 清理过程中保持“取消”可用
     if (!hasItems) {
@@ -710,6 +922,28 @@ void MainWindow::OnCleanClick() {
     if (highRiskCount > 0) {
         msg += L"\n\nHigh-risk / system-setting categories selected:" + highRiskList;
     }
+
+    const CleanupOptions options = scanner_->GetOptions();
+    if (options.smartMode) {
+        if (options.ageThresholdHours <= 0) {
+            msg += L"\n\nSmart mode: no age limit - every cache file in the selected categories will be removed.";
+        } else if (options.ageThresholdHours < 24) {
+            msg += L"\n\nSmart mode: files modified within the last " +
+                   std::to_wstring(options.ageThresholdHours) + L" hours will be kept.";
+        } else {
+            msg += L"\n\nSmart mode: files modified within the last " +
+                   std::to_wstring(options.ageThresholdHours / 24) + L" day(s) will be kept.";
+        }
+    }
+    std::wstring busyList;
+    for (const auto& item : results) {
+        if (item.enabled && item.scanned && item.appRunning) {
+            busyList += L"\n  - " + item.name + L" (" + item.runningProcess + L")";
+        }
+    }
+    if (!busyList.empty()) {
+        msg += L"\n\nThese categories are in use and will be skipped:" + busyList;
+    }
     int ret = MessageBoxW(hWnd_, msg.c_str(), L"Confirm Cleanup",
         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
     if (ret != IDYES) return;
@@ -776,11 +1010,16 @@ void MainWindow::OnRestoreClick() {
 }
 
 void MainWindow::SetListViewItem(int index, const CleanupItem& item) {
+    std::wstring displayName = item.name;
+    if (item.appRunning) {
+        displayName += L"  [in use]";
+    }
+
     LVITEMW lvi = {};
     lvi.mask = LVIF_TEXT | LVIF_PARAM;
     lvi.iItem = index;
     lvi.iSubItem = 0;
-    lvi.pszText = const_cast<LPWSTR>(item.name.c_str());
+    lvi.pszText = const_cast<LPWSTR>(displayName.c_str());
     lvi.lParam = static_cast<LPARAM>(index);
 
     if (index == ListView_GetItemCount(hListView_)) {

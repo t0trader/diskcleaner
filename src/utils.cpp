@@ -250,6 +250,34 @@ bool DeleteFileSafe(const std::wstring& path) {
     }
 }
 
+bool RemoveTreeForce(const std::wstring& path) {
+    std::error_code ec;
+    fs::remove_all(path, ec);
+    if (!ec) return true;
+
+    // 只读属性会阻止删除；清除后重试一次（不跟踪符号链接，避免影响目标）
+    fs::recursive_directory_iterator it(path,
+        fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end;
+    while (!ec && it != end) {
+        std::error_code entryEc;
+        if (it->is_symlink(entryEc)) {
+            it.disable_recursion_pending();
+        } else {
+            DWORD attrs = GetFileAttributesW(it->path().c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY)) {
+                SetFileAttributesW(it->path().c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+            }
+        }
+        it.increment(ec);
+    }
+
+    ec.clear();
+    fs::remove_all(path, ec);
+    std::error_code existsEc;
+    return !fs::exists(path, existsEc);
+}
+
 bool EmptyRecycleBin(HWND hwnd) {
     HRESULT hr = SHEmptyRecycleBinW(
         hwnd,

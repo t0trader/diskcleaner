@@ -66,9 +66,19 @@ std::vector<std::wstring> GetCategoryPaths(CleanupCategory category) {
             AddPath(paths, L"%LOCALAPPDATA%\\Mozilla\\Firefox\\Profiles\\*\\thumbnails");
             break;
         case CleanupCategory::EdgeCache:
+            // 匹配 Edge 与独立安装的 Edge SxS 全部配置（Default、Profile N ...）
             AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Cache");
             AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\Code Cache");
             AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\*\\GPUCache");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\Crashpad");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\component_crx_cache");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data\\ProvenanceData");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge SxS\\User Data\\*\\Cache");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge SxS\\User Data\\*\\Code Cache");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge SxS\\User Data\\*\\GPUCache");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge SxS\\User Data\\Crashpad");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge SxS\\User Data\\component_crx_cache");
+            AddPath(paths, L"%LOCALAPPDATA%\\Microsoft\\Edge SxS\\User Data\\ProvenanceData");
             break;
         case CleanupCategory::ErrorReports:
             // 用户级错误报告（系统级 WER 数据归 WERFull 分类）
@@ -388,21 +398,36 @@ std::vector<std::wstring> GetCategoryPaths(CleanupCategory category) {
             AddPath(paths, L"%APPDATA%\\Windsurf\\Service Worker");
             break;
         case CleanupCategory::TraeCache:
-            AddPath(paths, L"%APPDATA%\\Trae\\Cache");
-            AddPath(paths, L"%APPDATA%\\Trae\\CachedData");
-            AddPath(paths, L"%APPDATA%\\Trae\\Code Cache");
-            AddPath(paths, L"%APPDATA%\\Trae\\GPUCache");
-            AddPath(paths, L"%APPDATA%\\Trae\\logs");
-            AddPath(paths, L"%APPDATA%\\Trae\\WorkspacesStorage");
-            AddPath(paths, L"%APPDATA%\\Trae\\CachedExtensions");
-            AddPath(paths, L"%APPDATA%\\Trae\\CachedExtensionVSIXs");
+            // 国内版与海外版目录名不同（Trae CN / Trae）
+            for (const wchar_t* root : {L"%APPDATA%\\Trae CN", L"%APPDATA%\\Trae"}) {
+                const std::wstring base = root;
+                AddPath(paths, base + L"\\Cache");
+                AddPath(paths, base + L"\\CachedData");
+                AddPath(paths, base + L"\\Code Cache");
+                AddPath(paths, base + L"\\GPUCache");
+                AddPath(paths, base + L"\\logs");
+                AddPath(paths, base + L"\\WorkspacesStorage");
+                AddPath(paths, base + L"\\WorkspaceStorage");
+                AddPath(paths, base + L"\\CachedExtensions");
+                AddPath(paths, base + L"\\CachedExtensionVSIXs");
+            }
             break;
         case CleanupCategory::QoderCache:
-            // 只清理缓存/日志/临时/shell 快照，保留 auth/bin/plugins/agents/models/projects
+            // 只清理缓存/日志/临时目录，保留 auth/bin/plugins/projects/memories
+            AddPath(paths, L"%USERPROFILE%\\.qoder-cn\\logs");
+            AddPath(paths, L"%USERPROFILE%\\.qoder-cn\\tmp");
+            AddPath(paths, L"%USERPROFILE%\\.qoder-cn\\.cache");
             AddPath(paths, L"%USERPROFILE%\\.qoder\\.cache");
             AddPath(paths, L"%USERPROFILE%\\.qoder\\logs");
             AddPath(paths, L"%USERPROFILE%\\.qoder\\tmp");
             AddPath(paths, L"%USERPROFILE%\\.qoder\\shell-snapshots");
+            AddPath(paths, L"%APPDATA%\\com.qodercn.app.stable\\logs");
+            AddPath(paths, L"%APPDATA%\\com.qodercn.app.stable\\Cache");
+            AddPath(paths, L"%APPDATA%\\com.qodercn.app.stable\\CachedData");
+            AddPath(paths, L"%APPDATA%\\com.qodercn.app.stable\\Code Cache");
+            AddPath(paths, L"%APPDATA%\\com.qodercn.app.stable\\GPUCache");
+            AddPath(paths, L"%APPDATA%\\com.qodercn.app.stable\\Crashpad");
+            AddPath(paths, L"%APPDATA%\\com.qodercn.app.stable\\Service Worker");
             AddPath(paths, L"%APPDATA%\\Qoder\\Cache");
             AddPath(paths, L"%APPDATA%\\Qoder\\CachedData");
             AddPath(paths, L"%APPDATA%\\Qoder\\logs");
@@ -472,6 +497,35 @@ std::vector<std::wstring> GetCategoryPaths(CleanupCategory category) {
             AddPath(paths, L"%USERPROFILE%\\.warp\\cache");
             AddPath(paths, L"%USERPROFILE%\\.warp\\tmp");
             AddPath(paths, L"%USERPROFILE%\\.warp\\logs");
+            break;
+        case CleanupCategory::BrowserSWCache: {
+            // Chromium 系浏览器的 Service Worker 离线缓存（CacheStorage），
+            // 不含 Cookie/登录态/IndexedDB，删除后访问网站时自动重建。
+            const wchar_t* roots[] = {
+                L"%LOCALAPPDATA%\\Microsoft\\Edge\\User Data",
+                L"%LOCALAPPDATA%\\Microsoft\\Edge SxS\\User Data",
+                L"%LOCALAPPDATA%\\Microsoft\\Edge Beta\\User Data",
+                L"%LOCALAPPDATA%\\Microsoft\\Edge Dev\\User Data",
+                L"%LOCALAPPDATA%\\Microsoft\\Edge Canary\\User Data",
+                L"%LOCALAPPDATA%\\Google\\Chrome\\User Data",
+                L"%LOCALAPPDATA%\\Google\\Chrome Beta\\User Data",
+                L"%LOCALAPPDATA%\\Google\\Chrome Dev\\User Data",
+                L"%LOCALAPPDATA%\\Google\\Chrome SxS\\User Data",
+                L"%LOCALAPPDATA%\\BraveSoftware\\Brave-Browser\\User Data",
+                L"%LOCALAPPDATA%\\Vivaldi\\User Data",
+                L"%LOCALAPPDATA%\\Chromium\\User Data",
+            };
+            for (const wchar_t* root : roots) {
+                const std::wstring base = root;
+                AddPath(paths, base + L"\\*\\Service Worker\\CacheStorage");
+                AddPath(paths, base + L"\\*\\Service Worker\\ScriptCache");
+            }
+            break;
+        }
+        case CleanupCategory::WeChatMediaCache:
+            // 微信 4.x：日志与内置浏览器缓存；保留 radium\users（聊天数据）与 xplugin（插件）
+            AddPath(paths, L"%APPDATA%\\Tencent\\xwechat\\log");
+            AddPath(paths, L"%APPDATA%\\Tencent\\xwechat\\radium\\web");
             break;
         // 无文件路径的类别：RecycleBin / MemoryDump / EventLogs / FlushDNS /
         // CrashDumpSettings 由扫描/清理逻辑单独处理

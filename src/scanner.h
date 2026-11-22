@@ -26,6 +26,8 @@ public:
     void SetProgressCallback(ScanProgressCallback callback) { std::lock_guard<std::mutex> lock(resultsMutex_); progressCallback_ = std::move(callback); }
     void SetCompleteCallback(ScanCompleteCallback callback) { std::lock_guard<std::mutex> lock(resultsMutex_); completeCallback_ = std::move(callback); }
     void SetItemEnabled(CleanupCategory category, bool enabled);
+    void SetOptions(const CleanupOptions& options);
+    CleanupOptions GetOptions() const;
 
     static std::wstring GetCategoryName(CleanupCategory category);
     static std::wstring GetCategoryDescription(CleanupCategory category);
@@ -38,6 +40,8 @@ private:
 
     std::vector<CleanupItem> results_;
     mutable std::mutex resultsMutex_;
+    mutable std::mutex optionsMutex_;
+    CleanupOptions options_;
     std::atomic<bool> scanning_{false};
     std::atomic<bool> stopRequested_{false};
     std::thread scanThread_;

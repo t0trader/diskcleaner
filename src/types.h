@@ -108,7 +108,16 @@ enum class CleanupCategory {
     LingmaCache,              // 通义灵码缓存
     CodeGeeXCache,            // CodeGeeX 缓存
     WarpCache,                // Warp 终端缓存
+    BrowserSWCache,           // Chromium 系 Service Worker 缓存 (CacheStorage/ScriptCache)
+    WeChatMediaCache,         // 微信 4.x 日志与内置浏览器缓存
     Count
+};
+
+// 智能清理策略：扫描与清理共用，保证界面显示的大小就是实际可删除量
+struct CleanupOptions {
+    bool smartMode = true;        // 开启时间闸门
+    int ageThresholdHours = 24;   // 只删除超过该时长未修改的文件；0 表示不限制
+    bool skipRunningApps = true;  // 目标应用正在运行时整类跳过
 };
 
 // Risk level for cleanup items
@@ -128,6 +137,8 @@ struct CleanupItem {
     int64_t fileCount = 0;
     bool enabled = true;
     bool scanned = false;
+    bool appRunning = false;           // 关联应用正在运行
+    std::wstring runningProcess;       // 正在运行的进程名（用于提示）
 };
 
 } // namespace diskcleaner
